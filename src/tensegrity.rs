@@ -51,6 +51,10 @@ struct Spoke {
 }
 
 pub fn generate_sphere(frequency: usize, radius: f32) -> TensegritySphereBuffers {
+    generate_sphere_with_k(frequency, radius, PULL_K_AT_1M)
+}
+
+pub fn generate_sphere_with_k(frequency: usize, radius: f32, pull_k_at_1m: f32) -> TensegritySphereBuffers {
     use Cell::*;
 
     let mut scaffold = SphereScaffold::new(frequency);
@@ -186,7 +190,7 @@ pub fn generate_sphere(frequency: usize, radius: f32) -> TensegritySphereBuffers
             elastic_alpha.push(spoke.near_joint as u32);
             elastic_omega.push(next_spoke.near_joint as u32);
             elastic_ideal.push(circ_ideal);
-            elastic_k.push(PULL_K_AT_1M / circ_ideal);
+            elastic_k.push(pull_k_at_1m / circ_ideal);
 
             // Diagonal cable
             let next_near = spokes[(spoke_index + 1) % spokes.len()].near_joint;
@@ -201,7 +205,7 @@ pub fn generate_sphere(frequency: usize, radius: f32) -> TensegritySphereBuffers
                 elastic_alpha.push(next_near as u32);
                 elastic_omega.push(next_far as u32);
                 elastic_ideal.push(diag_ideal);
-                elastic_k.push(PULL_K_AT_1M / diag_ideal);
+                elastic_k.push(pull_k_at_1m / diag_ideal);
             }
         }
     }

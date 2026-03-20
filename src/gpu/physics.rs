@@ -3,6 +3,35 @@ use wgpu::util::DeviceExt;
 use crate::constants::*;
 use crate::tensegrity::TensegritySphereBuffers;
 
+/// Runtime-configurable physics parameters.
+/// Constants in `constants.rs` become the defaults.
+#[derive(Clone, Debug)]
+pub struct PhysicsConfig {
+    pub dt: f32,
+    pub iterations_per_frame: u32,
+    pub pull_k_at_1m: f32,
+    pub force_scale: f32,
+    pub drag: f32,
+    pub speed_limit: f32,
+    pub settle_iterations: u32,
+    pub settle_drag: f32,
+}
+
+impl Default for PhysicsConfig {
+    fn default() -> Self {
+        Self {
+            dt: ITERATION_DT,
+            iterations_per_frame: ITERATIONS_PER_FRAME,
+            pull_k_at_1m: PULL_K_AT_1M,
+            force_scale: FORCE_SCALE,
+            drag: DRAG,
+            speed_limit: SPEED_LIMIT,
+            settle_iterations: SETTLE_ITERATIONS,
+            settle_drag: 100.0,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct PhysicsParams {
@@ -25,7 +54,6 @@ pub struct PhysicsCompute {
     interval_bind_group: wgpu::BindGroup,
     params_bind_group: wgpu::BindGroup,
     half_kick_pipeline: wgpu::ComputePipeline,
-    reset_forces_pipeline: wgpu::ComputePipeline,
     elastic_forces_pipeline: wgpu::ComputePipeline,
     rigid_mass_pipeline: wgpu::ComputePipeline,
     second_half_kick_pipeline: wgpu::ComputePipeline,
@@ -46,28 +74,28 @@ impl PhysicsCompute {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         buffers: &TensegritySphereBuffers,
-        iterations: u32,
+        config: &PhysicsConfig,
     ) -> Vec<[f32; 4]> {
         let num_joints = buffers.num_joints();
         let settling_params = PhysicsParams {
-            dt: ITERATION_DT,
+            dt: config.dt,
             gravity: 0.0,           // no gravity during settling
-            drag: 100.0,            // strong damping for convergence
+            drag: config.settle_drag,
             viscosity: 0.0,
             num_joints,
             num_elastic: buffers.num_elastic(),
             num_rigid: buffers.num_rigid(),
             ambient_mass: JOINT_AMBIENT_MASS,
-            force_scale: FORCE_SCALE,
+            force_scale: config.force_scale,
             ground_y: -1e6,         // ground far away — irrelevant
             restitution: 0.0,
             speed_limit: f32::MAX,  // no speed limit during settling
         };
         let physics = Self::with_params(device, buffers, settling_params);
 
-        // Batch settling into chunks to avoid GPU timeout
-        let chunk = 40;
-        let mut remaining = iterations;
+        // Batch settling into chunks — with single compute pass this can be larger
+        let chunk = 200;
+        let mut remaining = config.settle_iterations;
         while remaining > 0 {
             let n = remaining.min(chunk);
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -87,20 +115,20 @@ impl PhysicsCompute {
         physics.read_positions(device)
     }
 
-    pub fn new(device: &wgpu::Device, _queue: &wgpu::Queue, buffers: &TensegritySphereBuffers) -> Self {
+    pub fn new(device: &wgpu::Device, _queue: &wgpu::Queue, buffers: &TensegritySphereBuffers, config: &PhysicsConfig) -> Self {
         let params = PhysicsParams {
-            dt: ITERATION_DT,
+            dt: config.dt,
             gravity: GRAVITY,
-            drag: DRAG,
+            drag: config.drag,
             viscosity: VISCOSITY,
             num_joints: buffers.num_joints(),
             num_elastic: buffers.num_elastic(),
             num_rigid: buffers.num_rigid(),
             ambient_mass: JOINT_AMBIENT_MASS,
-            force_scale: FORCE_SCALE,
+            force_scale: config.force_scale,
             ground_y: GROUND_Y,
             restitution: RESTITUTION,
-            speed_limit: SPEED_LIMIT,
+            speed_limit: config.speed_limit,
         };
         Self::with_params(device, buffers, params)
     }
@@ -315,7 +343,6 @@ impl PhysicsCompute {
         };
 
         let half_kick_pipeline = make_pipeline("half_kick_and_drift");
-        let reset_forces_pipeline = make_pipeline("reset_forces");
         let elastic_forces_pipeline = make_pipeline("elastic_forces");
         let rigid_mass_pipeline = make_pipeline("rigid_mass");
         let second_half_kick_pipeline = make_pipeline("second_half_kick");
@@ -328,7 +355,6 @@ impl PhysicsCompute {
             interval_bind_group,
             params_bind_group,
             half_kick_pipeline,
-            reset_forces_pipeline,
             elastic_forces_pipeline,
             rigid_mass_pipeline,
             second_half_kick_pipeline,
@@ -348,124 +374,60 @@ impl PhysicsCompute {
         let elastic_groups = if self.num_elastic > 0 { (self.num_elastic + 63) / 64 } else { 0 };
         let rigid_groups = if self.num_rigid > 0 { (self.num_rigid + 63) / 64 } else { 0 };
 
-        for _ in 0..iterations {
-            // Pass 1: Half kick + drift
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Half Kick"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.half_kick_pipeline);
-                pass.set_bind_group(0, &self.joint_bind_group, &[]);
-                pass.set_bind_group(1, &self.interval_bind_group, &[]);
-                pass.set_bind_group(2, &self.params_bind_group, &[]);
-                pass.dispatch_workgroups(joint_groups, 1, 1);
-            }
+        // Single compute pass for all iterations — wgpu guarantees sequential
+        // execution with implicit storage barriers between dispatches.
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("Physics"),
+            timestamp_writes: None,
+        });
+        pass.set_bind_group(0, &self.joint_bind_group, &[]);
+        pass.set_bind_group(1, &self.interval_bind_group, &[]);
+        pass.set_bind_group(2, &self.params_bind_group, &[]);
 
-            // Pass 2: SHAKE — correct positions to maintain rigid strut lengths
+        for _ in 0..iterations {
+            // 1: Half kick + drift
+            pass.set_pipeline(&self.half_kick_pipeline);
+            pass.dispatch_workgroups(joint_groups, 1, 1);
+
+            // 2: SHAKE — correct positions to maintain rigid strut lengths
             if rigid_groups > 0 {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("SHAKE Constraints"),
-                    timestamp_writes: None,
-                });
                 pass.set_pipeline(&self.shake_pipeline);
-                pass.set_bind_group(0, &self.joint_bind_group, &[]);
-                pass.set_bind_group(1, &self.interval_bind_group, &[]);
-                pass.set_bind_group(2, &self.params_bind_group, &[]);
                 pass.dispatch_workgroups(rigid_groups, 1, 1);
             }
 
-            // Pass 3: Reset forces
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Reset Forces"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.reset_forces_pipeline);
-                pass.set_bind_group(0, &self.joint_bind_group, &[]);
-                pass.set_bind_group(1, &self.interval_bind_group, &[]);
-                pass.set_bind_group(2, &self.params_bind_group, &[]);
-                pass.dispatch_workgroups(joint_groups, 1, 1);
-            }
-
-            // Pass 4: Elastic forces
+            // 3: Elastic forces
             if elastic_groups > 0 {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Elastic Forces"),
-                    timestamp_writes: None,
-                });
                 pass.set_pipeline(&self.elastic_forces_pipeline);
-                pass.set_bind_group(0, &self.joint_bind_group, &[]);
-                pass.set_bind_group(1, &self.interval_bind_group, &[]);
-                pass.set_bind_group(2, &self.params_bind_group, &[]);
                 pass.dispatch_workgroups(elastic_groups, 1, 1);
             }
 
-            // Pass 5: Rigid mass
+            // 4: Rigid mass
             if rigid_groups > 0 {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Rigid Mass"),
-                    timestamp_writes: None,
-                });
                 pass.set_pipeline(&self.rigid_mass_pipeline);
-                pass.set_bind_group(0, &self.joint_bind_group, &[]);
-                pass.set_bind_group(1, &self.interval_bind_group, &[]);
-                pass.set_bind_group(2, &self.params_bind_group, &[]);
                 pass.dispatch_workgroups(rigid_groups, 1, 1);
             }
 
-            // Pass 6: Second half kick
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Second Half Kick"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.second_half_kick_pipeline);
-                pass.set_bind_group(0, &self.joint_bind_group, &[]);
-                pass.set_bind_group(1, &self.interval_bind_group, &[]);
-                pass.set_bind_group(2, &self.params_bind_group, &[]);
-                pass.dispatch_workgroups(joint_groups, 1, 1);
-            }
+            // 5: Second half kick (includes force reset for next iteration)
+            pass.set_pipeline(&self.second_half_kick_pipeline);
+            pass.dispatch_workgroups(joint_groups, 1, 1);
 
-            // Pass 7: RATTLE — project out velocity along rigid strut axes
+            // 6: RATTLE — project out velocity along rigid strut axes
             if rigid_groups > 0 {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("RATTLE Constraints"),
-                    timestamp_writes: None,
-                });
                 pass.set_pipeline(&self.rattle_pipeline);
-                pass.set_bind_group(0, &self.joint_bind_group, &[]);
-                pass.set_bind_group(1, &self.interval_bind_group, &[]);
-                pass.set_bind_group(2, &self.params_bind_group, &[]);
                 pass.dispatch_workgroups(rigid_groups, 1, 1);
             }
 
-            // Pass 8: Ground collision
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Ground Collision"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.ground_collision_pipeline);
-                pass.set_bind_group(0, &self.joint_bind_group, &[]);
-                pass.set_bind_group(1, &self.interval_bind_group, &[]);
-                pass.set_bind_group(2, &self.params_bind_group, &[]);
-                pass.dispatch_workgroups(joint_groups, 1, 1);
-            }
+            // 7: Ground collision
+            pass.set_pipeline(&self.ground_collision_pipeline);
+            pass.dispatch_workgroups(joint_groups, 1, 1);
 
-            // Pass 9: SHAKE again — ground collision moved joints, fix constraint violations
+            // 8: SHAKE again — ground collision moved joints, fix constraint violations
             if rigid_groups > 0 {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Post-Collision SHAKE"),
-                    timestamp_writes: None,
-                });
                 pass.set_pipeline(&self.shake_pipeline);
-                pass.set_bind_group(0, &self.joint_bind_group, &[]);
-                pass.set_bind_group(1, &self.interval_bind_group, &[]);
-                pass.set_bind_group(2, &self.params_bind_group, &[]);
                 pass.dispatch_workgroups(rigid_groups, 1, 1);
             }
         }
+        // pass drops here, ending the single compute pass
     }
 
     pub fn copy_positions_to_staging(&self, encoder: &mut wgpu::CommandEncoder) {

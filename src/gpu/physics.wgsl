@@ -120,19 +120,7 @@ fn shake_constraints(@builtin(global_invocation_id) id: vec3<u32>) {
     positions[o] = pos_o;
 }
 
-// Pass 3: Reset forces and masses
-@compute @workgroup_size(64)
-fn reset_forces(@builtin(global_invocation_id) id: vec3<u32>) {
-    let idx = id.x;
-    if idx >= params.num_joints { return; }
-
-    atomicStore(&force_x[idx], 0);
-    atomicStore(&force_y[idx], 0);
-    atomicStore(&force_z[idx], 0);
-    atomicStore(&masses[idx], i32(params.ambient_mass * MASS_SCALE));
-}
-
-// Pass 4: Elastic forces (cables)
+// Pass 3: Elastic forces (cables)
 @compute @workgroup_size(64)
 fn elastic_forces(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
@@ -184,7 +172,7 @@ fn elastic_forces(@builtin(global_invocation_id) id: vec3<u32>) {
     atomicAdd(&masses[o], half_mass);
 }
 
-// Pass 5: Rigid mass contribution
+// Pass 4: Rigid mass contribution
 @compute @workgroup_size(64)
 fn rigid_mass(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
@@ -198,7 +186,7 @@ fn rigid_mass(@builtin(global_invocation_id) id: vec3<u32>) {
     atomicAdd(&masses[o], hm);
 }
 
-// Pass 6: Second half kick with gravity and damping
+// Pass 5: Second half kick with gravity, damping, and force reset for next iteration
 @compute @workgroup_size(64)
 fn second_half_kick(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
@@ -213,6 +201,12 @@ fn second_half_kick(@builtin(global_invocation_id) id: vec3<u32>) {
     let fx = f32(atomicLoad(&force_x[idx])) / params.force_scale;
     let fy = f32(atomicLoad(&force_y[idx])) / params.force_scale;
     let fz = f32(atomicLoad(&force_z[idx])) / params.force_scale;
+
+    // Reset forces and masses for next iteration (always, even for nuked joints)
+    atomicStore(&force_x[idx], 0);
+    atomicStore(&force_y[idx], 0);
+    atomicStore(&force_z[idx], 0);
+    atomicStore(&masses[idx], i32(params.ambient_mass * MASS_SCALE));
 
     let inv_m = select(0.0, 1.0 / m, m > 0.0);
 
@@ -233,7 +227,7 @@ fn second_half_kick(@builtin(global_invocation_id) id: vec3<u32>) {
     velocities[idx] = vel;
 }
 
-// Pass 7: RATTLE — project out velocity along rigid constraint axis.
+// Pass 6: RATTLE — project out velocity along rigid constraint axis.
 // Ensures joints connected by a rigid interval have no relative velocity
 // along the strut, preserving the constraint after velocity updates.
 @compute @workgroup_size(64)
@@ -280,7 +274,7 @@ fn rattle_constraints(@builtin(global_invocation_id) id: vec3<u32>) {
     velocities[o] = vel_o;
 }
 
-// Pass 8: Ground plane collision
+// Pass 7: Ground plane collision
 @compute @workgroup_size(64)
 fn ground_collision(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;

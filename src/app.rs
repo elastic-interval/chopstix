@@ -9,7 +9,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::camera::Camera;
 use crate::constants::*;
-use crate::gpu::physics::PhysicsCompute;
+use crate::gpu::physics::{PhysicsCompute, PhysicsConfig};
 use crate::gpu::renderer::Renderer;
 use crate::gpu::Gpu;
 use crate::tensegrity::{self, TensegritySphereBuffers};
@@ -46,16 +46,16 @@ impl App {
     }
 
     fn rebuild_sphere(state: &mut AppState) {
+        let config = PhysicsConfig::default();
         let mut buffers = tensegrity::generate_sphere(state.frequency, SPHERE_RADIUS);
         // Settle: run physics with high drag, no gravity to find pre-stress equilibrium
         buffers.positions = PhysicsCompute::settle(
-            &state.gpu.device, &state.gpu.queue, &buffers, SETTLE_ITERATIONS,
+            &state.gpu.device, &state.gpu.queue, &buffers, &config,
         );
-        let dt = ITERATION_DT;
-        state.iterations = ITERATIONS_PER_FRAME;
+        state.iterations = config.iterations_per_frame;
         log::info!("Physics: dt={:.6}s, iterations={}, sim_time/frame={:.3}ms",
-            dt, state.iterations, dt * state.iterations as f32 * 1000.0);
-        state.physics = PhysicsCompute::new(&state.gpu.device, &state.gpu.queue, &buffers);
+            config.dt, state.iterations, config.dt * state.iterations as f32 * 1000.0);
+        state.physics = PhysicsCompute::new(&state.gpu.device, &state.gpu.queue, &buffers, &config);
         state.renderer.update_topology(&buffers, state.frequency);
         state.camera.set_distance(SPHERE_RADIUS * 2.8);
         state.buffers = buffers;
@@ -92,15 +92,15 @@ impl ApplicationHandler for App {
         );
 
         let gpu = Gpu::new(window.clone());
+        let config = PhysicsConfig::default();
         let mut buffers = tensegrity::generate_sphere(self.frequency, SPHERE_RADIUS);
         buffers.positions = PhysicsCompute::settle(
-            &gpu.device, &gpu.queue, &buffers, SETTLE_ITERATIONS,
+            &gpu.device, &gpu.queue, &buffers, &config,
         );
-        let dt = ITERATION_DT;
-        let iterations = ITERATIONS_PER_FRAME;
+        let iterations = config.iterations_per_frame;
         log::info!("Physics: dt={:.6}s, iterations={}, sim_time/frame={:.3}ms",
-            dt, iterations, dt * iterations as f32 * 1000.0);
-        let physics = PhysicsCompute::new(&gpu.device, &gpu.queue, &buffers);
+            config.dt, iterations, config.dt * iterations as f32 * 1000.0);
+        let physics = PhysicsCompute::new(&gpu.device, &gpu.queue, &buffers, &config);
         let size = window.inner_size();
         let renderer = Renderer::new(&gpu, &buffers, self.frequency);
         let camera = Camera::new(size.width as f32, size.height as f32, SPHERE_RADIUS * 2.8);
