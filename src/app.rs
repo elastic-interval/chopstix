@@ -9,11 +9,15 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::camera::Camera;
 use crate::constants::*;
-use crate::gpu::hud::{Hud, FREQ_CHOICES, FREQ_BUTTON_WIDTH, FREQ_BAR_HEIGHT, FREQ_BAR_TOP};
+use crate::gpu::hud::{Hud, FREQ_CHOICES, FREQ_BUTTON_WIDTH, FREQ_BAR_HEIGHT, FREQ_BAR_TOP,
+    KLEIN_GRID, KLEIN_GRID_COLS, KLEIN_GRID_ROWS, KLEIN_BUTTON_WIDTH, KLEIN_ROW_HEIGHT,
+    KLEIN_GRID_TOP};
 use crate::gpu::physics::{PhysicsCompute, PhysicsConfig};
 use crate::gpu::renderer::Renderer;
 use crate::gpu::Gpu;
 use crate::tensegrity::{self, TensegritySphereBuffers};
+use crate::klein;
+use crate::ShapeConfig;
 
 
 struct AppState {
@@ -24,6 +28,7 @@ struct AppState {
     hud: Hud,
     camera: Camera,
     buffers: TensegritySphereBuffers,
+    shape: ShapeConfig,
     frequency: usize,
     iterations: u32,
     paused: bool,
@@ -43,33 +48,80 @@ struct AppState {
 
 pub struct App {
     state: Option<AppState>,
-    frequency: usize,
+    shape: ShapeConfig,
 }
 
 impl App {
-    pub fn new(frequency: usize) -> Self {
+    pub fn new(shape: ShapeConfig) -> Self {
         Self {
             state: None,
-            frequency,
+            shape,
         }
     }
 
-    fn rebuild_sphere(state: &mut AppState) {
-        let config = PhysicsConfig {
-            pull_k_at_1m: state.pull_k_at_1m,
+    fn generate_shape(shape: &ShapeConfig, pull_k_at_1m: f32) -> TensegritySphereBuffers {
+        match shape {
+            ShapeConfig::Sphere { frequency } => {
+                tensegrity::generate_sphere_with_k(*frequency, SPHERE_RADIUS, pull_k_at_1m)
+            }
+            ShapeConfig::Klein { width, height, shift } => {
+                klein::generate_klein(*width, *height, *shift, pull_k_at_1m)
+            }
+        }
+    }
+
+    fn frequency_for_shape(shape: &ShapeConfig) -> usize {
+        match shape {
+            ShapeConfig::Sphere { frequency } => *frequency,
+            ShapeConfig::Klein { width, height, .. } => {
+                // Equivalent visual frequency from joint count.
+                // Sphere: joints ≈ 10 * freq², so freq ≈ sqrt(joints / 10).
+                let joints = width * height / 2;
+                ((joints as f32 / 10.0).sqrt() as usize).max(1)
+            }
+        }
+    }
+
+    /// Build a PhysicsConfig appropriate for the current shape.
+    /// Klein: no gravity, no ground. Spheres: normal gravity/ground.
+    fn physics_config(shape: &ShapeConfig, pull_k_at_1m: f32, frequency: usize) -> PhysicsConfig {
+        let mut config = PhysicsConfig {
+            pull_k_at_1m,
             ..PhysicsConfig::default()
-        }.scaled_for_frequency(state.frequency);
-        let mut buffers = tensegrity::generate_sphere_with_k(state.frequency, SPHERE_RADIUS, state.pull_k_at_1m);
-        // Settle: run physics with high drag, no gravity to find pre-stress equilibrium
-        buffers.positions = PhysicsCompute::settle(
-            &state.gpu.device, &state.gpu.queue, &buffers, &config,
-        );
+        };
+        if matches!(shape, ShapeConfig::Klein { .. }) {
+            config.gravity = 0.0;
+            config.ground_y = -1e6;
+        }
+        config.scaled_for_frequency(frequency)
+    }
+
+    fn rebuild_shape(state: &mut AppState) {
+        let config = App::physics_config(&state.shape, state.pull_k_at_1m, state.frequency);
+        let mut buffers = App::generate_shape(&state.shape, state.pull_k_at_1m);
+
+        // Settle: use approach-based settling for spring-push (Klein), regular for spheres
+        if buffers.use_spring_push {
+            buffers.positions = PhysicsCompute::settle_with_approach(
+                &state.gpu.device, &state.gpu.queue, &mut buffers, &config,
+            );
+            buffers.velocities = vec![[0.0f32; 4]; buffers.positions.len()];
+        } else {
+            buffers.positions = PhysicsCompute::settle(
+                &state.gpu.device, &state.gpu.queue, &buffers, &config,
+            );
+        }
+
         state.iterations = config.iterations_per_frame;
         log::info!("Physics: dt={:.6}s, iterations={}, sim_time/frame={:.3}ms",
             config.dt, state.iterations, config.dt * state.iterations as f32 * 1000.0);
         state.physics = PhysicsCompute::new(&state.gpu.device, &state.gpu.queue, &buffers, &config);
         state.renderer.update_topology(&buffers, state.frequency);
-        state.camera.set_distance(SPHERE_RADIUS * 2.8);
+
+        // Camera distance based on bounding radius
+        let bounding_radius = compute_bounding_radius(&buffers.positions);
+        state.camera.set_distance(bounding_radius * 2.8);
+
         state.buffers = buffers;
         state.renderer.update_instances(&state.gpu.device, &state.buffers.positions);
         update_title(state);
@@ -77,10 +129,7 @@ impl App {
 
     /// Update cable stiffness without resettling — keeps current positions/velocities.
     fn update_stiffness(state: &mut AppState) {
-        let config = PhysicsConfig {
-            pull_k_at_1m: state.pull_k_at_1m,
-            ..PhysicsConfig::default()
-        }.scaled_for_frequency(state.frequency);
+        let config = App::physics_config(&state.shape, state.pull_k_at_1m, state.frequency);
 
         // Read back current positions from GPU
         let mut encoder = state.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -90,8 +139,11 @@ impl App {
         state.gpu.queue.submit(std::iter::once(encoder.finish()));
         let current_positions = state.physics.read_positions(&state.gpu.device);
 
-        // Recompute K values from existing ideal lengths — no sphere regeneration
+        // Recompute K values from existing ideal lengths — no regeneration
         for (k, ideal) in state.buffers.elastic_k.iter_mut().zip(state.buffers.elastic_ideal.iter()) {
+            *k = state.pull_k_at_1m / ideal;
+        }
+        for (k, ideal) in state.buffers.push_k.iter_mut().zip(state.buffers.push_ideal.iter()) {
             *k = state.pull_k_at_1m / ideal;
         }
         state.buffers.positions = current_positions;
@@ -106,10 +158,7 @@ impl App {
     fn adjust_pretension(state: &mut AppState, factor: f32) {
         state.pretension = (state.pretension * factor).clamp(0.5, 1.0);
 
-        let config = PhysicsConfig {
-            pull_k_at_1m: state.pull_k_at_1m,
-            ..PhysicsConfig::default()
-        }.scaled_for_frequency(state.frequency);
+        let config = App::physics_config(&state.shape, state.pull_k_at_1m, state.frequency);
 
         // Read back current positions
         let mut encoder = state.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -123,6 +172,11 @@ impl App {
         for i in 0..state.buffers.elastic_ideal.len() {
             state.buffers.elastic_ideal[i] *= factor;
             state.buffers.elastic_k[i] = state.pull_k_at_1m / state.buffers.elastic_ideal[i];
+        }
+        // Also scale push ideal lengths for Klein
+        for i in 0..state.buffers.push_ideal.len() {
+            state.buffers.push_ideal[i] *= factor;
+            state.buffers.push_k[i] = state.pull_k_at_1m / state.buffers.push_ideal[i];
         }
         state.buffers.positions = current_positions;
 
@@ -154,6 +208,32 @@ impl App {
         App::freq_bar_hover_index(state).map(|i| FREQ_CHOICES[i])
     }
 
+    /// Returns (row, col) of the Klein grid button the cursor is over, if any.
+    fn klein_grid_hover(state: &AppState) -> Option<(usize, usize)> {
+        let grid_left = state.hud.klein_grid_left() as f64;
+        let (cx, cy) = state.cursor_pos;
+        if cy < KLEIN_GRID_TOP as f64
+            || cy > (KLEIN_GRID_TOP + KLEIN_GRID_ROWS as f32 * KLEIN_ROW_HEIGHT) as f64
+        {
+            return None;
+        }
+        if cx < grid_left {
+            return None;
+        }
+        let row = ((cy - KLEIN_GRID_TOP as f64) / KLEIN_ROW_HEIGHT as f64) as usize;
+        let col = ((cx - grid_left) / KLEIN_BUTTON_WIDTH as f64) as usize;
+        if row < KLEIN_GRID_ROWS && col < KLEIN_GRID_COLS {
+            Some((row, col))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the (width, height) of the Klein grid button at cursor, if any.
+    fn klein_grid_hit(state: &AppState) -> Option<(usize, usize)> {
+        App::klein_grid_hover(state).map(|(r, c)| KLEIN_GRID[r][c])
+    }
+
     /// Apply slider position from current cursor Y.
     fn apply_slider_drag(state: &mut AppState) {
         let Some(col) = state.dragging_slider else { return };
@@ -175,12 +255,35 @@ impl App {
     }
 }
 
+fn compute_bounding_radius(positions: &[[f32; 4]]) -> f32 {
+    if positions.is_empty() {
+        return SPHERE_RADIUS;
+    }
+    let n = positions.len() as f32;
+    let cx: f32 = positions.iter().map(|p| p[0]).sum::<f32>() / n;
+    let cy: f32 = positions.iter().map(|p| p[1]).sum::<f32>() / n;
+    let cz: f32 = positions.iter().map(|p| p[2]).sum::<f32>() / n;
+    positions.iter()
+        .map(|p| {
+            let dx = p[0] - cx;
+            let dy = p[1] - cy;
+            let dz = p[2] - cz;
+            (dx * dx + dy * dy + dz * dz).sqrt()
+        })
+        .fold(0.0f32, f32::max)
+}
+
 fn update_title(state: &AppState) {
+    let shape_tag = match &state.shape {
+        ShapeConfig::Sphere { frequency } => format!("sphere freq={}", frequency),
+        ShapeConfig::Klein { width, height, .. } => format!("klein {}x{}", width, height),
+    };
+    let num_struts = state.buffers.num_rigid() + state.buffers.num_push();
     state.window.set_title(&format!(
-        "Chopstix | freq={} | joints={} | struts={} | cables={} | K={:.0e} | {:.0} FPS",
-        state.frequency,
+        "Chopstix | {} | joints={} | struts={} | cables={} | K={:.0e} | {:.0} FPS",
+        shape_tag,
         state.buffers.num_joints(),
-        state.buffers.num_rigid(),
+        num_struts,
         state.buffers.num_elastic(),
         state.pull_k_at_1m,
         state.last_fps,
@@ -204,19 +307,32 @@ impl ApplicationHandler for App {
         );
 
         let gpu = Gpu::new(window.clone());
-        let config = PhysicsConfig::default().scaled_for_frequency(self.frequency);
-        let mut buffers = tensegrity::generate_sphere(self.frequency, SPHERE_RADIUS);
-        buffers.positions = PhysicsCompute::settle(
-            &gpu.device, &gpu.queue, &buffers, &config,
-        );
+        let frequency = App::frequency_for_shape(&self.shape);
+        let config = App::physics_config(&self.shape, PULL_K_AT_1M, frequency);
+        let mut buffers = App::generate_shape(&self.shape, PULL_K_AT_1M);
+
+        // Settle
+        if buffers.use_spring_push {
+            buffers.positions = PhysicsCompute::settle_with_approach(
+                &gpu.device, &gpu.queue, &mut buffers, &config,
+            );
+            buffers.velocities = vec![[0.0f32; 4]; buffers.positions.len()];
+        } else {
+            buffers.positions = PhysicsCompute::settle(
+                &gpu.device, &gpu.queue, &buffers, &config,
+            );
+        }
+
         let iterations = config.iterations_per_frame;
         log::info!("Physics: dt={:.6}s, iterations={}, sim_time/frame={:.3}ms",
             config.dt, iterations, config.dt * iterations as f32 * 1000.0);
         let physics = PhysicsCompute::new(&gpu.device, &gpu.queue, &buffers, &config);
         let size = window.inner_size();
-        let renderer = Renderer::new(&gpu, &buffers, self.frequency);
+        let renderer = Renderer::new(&gpu, &buffers, frequency);
         let hud = Hud::new(&gpu.device, &gpu.queue, gpu.surface_config.format);
-        let camera = Camera::new(size.width as f32, size.height as f32, SPHERE_RADIUS * 2.8);
+
+        let bounding_radius = compute_bounding_radius(&buffers.positions);
+        let camera = Camera::new(size.width as f32, size.height as f32, bounding_radius * 2.8);
 
         let mut state = AppState {
             window,
@@ -226,7 +342,8 @@ impl ApplicationHandler for App {
             hud,
             camera,
             buffers,
-            frequency: self.frequency,
+            shape: self.shape.clone(),
+            frequency,
             iterations,
             paused: true,
             last_frame: Instant::now(),
@@ -292,14 +409,27 @@ impl ApplicationHandler for App {
                 ..
             } => match button_state {
                 ElementState::Pressed => {
-                    // Check frequency bar hit
+                    // Sphere frequency bar — click always switches to sphere
                     if let Some(freq) = App::freq_bar_hit(state) {
-                        if freq != state.frequency {
-                            state.frequency = freq;
-                            App::rebuild_sphere(state);
+                        let already = matches!(state.shape, ShapeConfig::Sphere { frequency: f } if f == freq);
+                        if !already {
+                            state.shape = ShapeConfig::Sphere { frequency: freq };
+                            state.frequency = App::frequency_for_shape(&state.shape);
+                            App::rebuild_shape(state);
+                            return;
                         }
-                    } else if let Some(col) = state.hud.slider_hit(state.cursor_pos.0) {
-                        // Start dragging a slider
+                    }
+                    // Klein grid — click always switches to klein
+                    if let Some((w, h)) = App::klein_grid_hit(state) {
+                        let already = matches!(state.shape, ShapeConfig::Klein { width, height, .. } if width == w && height == h);
+                        if !already {
+                            state.shape = ShapeConfig::Klein { width: w, height: h, shift: 0 };
+                            state.frequency = App::frequency_for_shape(&state.shape);
+                            App::rebuild_shape(state);
+                            return;
+                        }
+                    }
+                    if let Some(col) = state.hud.slider_hit(state.cursor_pos.0) {
                         state.dragging_slider = Some(col);
                         App::apply_slider_drag(state);
                     } else {
@@ -359,8 +489,7 @@ impl ApplicationHandler for App {
 
                 // Update HUD
                 if state.show_hud {
-                    let config = PhysicsConfig { pull_k_at_1m: state.pull_k_at_1m, ..PhysicsConfig::default() }
-                        .scaled_for_frequency(state.frequency);
+                    let config = App::physics_config(&state.shape, state.pull_k_at_1m, state.frequency);
                     let paused_tag = if state.paused { "  PAUSED" } else { "" };
 
                     // Title
@@ -368,9 +497,20 @@ impl ApplicationHandler for App {
                         "{:.0} FPS{}", state.last_fps, paused_tag,
                     ));
 
-                    // Frequency bar
+                    // Both shape selection bars always visible
+                    let sphere_freq = match &state.shape {
+                        ShapeConfig::Sphere { frequency } => *frequency,
+                        _ => 0, // nothing highlighted
+                    };
                     let hover_idx = App::freq_bar_hover_index(state);
-                    state.hud.set_freq_bar(state.frequency, hover_idx);
+                    state.hud.set_freq_bar(sphere_freq, hover_idx);
+
+                    let (klein_w, klein_h) = match &state.shape {
+                        ShapeConfig::Klein { width, height, .. } => (*width, *height),
+                        _ => (0, 0), // nothing highlighted
+                    };
+                    let klein_hover = App::klein_grid_hover(state);
+                    state.hud.set_klein_grid(klein_w, klein_h, klein_hover);
 
                     // Legend
                     state.hud.set_legend(&[
@@ -388,9 +528,12 @@ impl ApplicationHandler for App {
                         hover_col == Some(1) || state.dragging_slider == Some(1));
 
                     // Info: stats (bottom-right)
+                    let num_struts = state.buffers.num_rigid() + state.buffers.num_push();
+                    let mode_tag = if state.buffers.use_spring_push { "spring" } else { "SHAKE" };
                     state.hud.set_info(&format!(
-                        "{} joints  {} struts  {} cables\ndt {:.0}us  {} iter/frame",
-                        state.buffers.num_joints(), state.buffers.num_rigid(), state.buffers.num_elastic(),
+                        "{} joints  {} struts  {} cables  [{}]\ndt {:.0}us  {} iter/frame",
+                        state.buffers.num_joints(), num_struts, state.buffers.num_elastic(),
+                        mode_tag,
                         config.dt * 1e6, config.iterations_per_frame,
                     ));
 

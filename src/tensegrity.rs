@@ -14,6 +14,14 @@ pub struct TensegritySphereBuffers {
     pub rigid_omega: Vec<u32>,
     pub rigid_length: Vec<f32>,
     pub rigid_half_mass: Vec<f32>,
+    // Spring-based push intervals (for shared-joint topologies like Klein bottles)
+    pub push_alpha: Vec<u32>,
+    pub push_omega: Vec<u32>,
+    pub push_ideal: Vec<f32>,
+    pub push_k: Vec<f32>,
+    pub push_half_mass: Vec<f32>,
+    /// True if push intervals share joints, requiring spring-push mode instead of SHAKE/RATTLE
+    pub use_spring_push: bool,
 }
 
 impl TensegritySphereBuffers {
@@ -28,6 +36,11 @@ impl TensegritySphereBuffers {
     pub fn num_rigid(&self) -> u32 {
         self.rigid_alpha.len() as u32
     }
+
+    pub fn num_push(&self) -> u32 {
+        self.push_alpha.len() as u32
+    }
+
 }
 
 enum Cell {
@@ -50,6 +63,7 @@ struct Spoke {
     length: f32,
 }
 
+#[allow(dead_code)]
 pub fn generate_sphere(frequency: usize, radius: f32) -> TensegritySphereBuffers {
     generate_sphere_with_k(frequency, radius, PULL_K_AT_1M)
 }
@@ -242,5 +256,11 @@ pub fn generate_sphere_with_k(frequency: usize, radius: f32, pull_k_at_1m: f32) 
         rigid_omega,
         rigid_length,
         rigid_half_mass,
+        push_alpha: Vec::new(),
+        push_omega: Vec::new(),
+        push_ideal: Vec::new(),
+        push_k: Vec::new(),
+        push_half_mass: Vec::new(),
+        use_spring_push: false,
     }
 }

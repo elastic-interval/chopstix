@@ -16,6 +16,13 @@
 @group(1) @binding(6) var<storage, read> rigid_length: array<f32>;
 @group(1) @binding(7) var<storage, read> rigid_half_mass: array<f32>;
 
+// Push interval topology (Group 3) — spring-based push (Klein bottles etc.)
+@group(3) @binding(0) var<storage, read> push_alpha: array<u32>;
+@group(3) @binding(1) var<storage, read> push_omega: array<u32>;
+@group(3) @binding(2) var<storage, read> push_ideal: array<f32>;
+@group(3) @binding(3) var<storage, read> push_k: array<f32>;
+@group(3) @binding(4) var<storage, read> push_half_mass: array<f32>;
+
 // Uniform params (Group 2)
 struct Params {
     dt: f32,
@@ -30,6 +37,10 @@ struct Params {
     ground_y: f32,
     restitution: f32,
     speed_limit: f32,
+    num_push: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
 }
 @group(2) @binding(0) var<uniform> params: Params;
 
@@ -298,4 +309,56 @@ fn ground_collision(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         velocities[idx] = vel;
     }
+}
+
+// Push forces — spring-based push intervals (no slack check, resists both compression and extension)
+// Used for Klein bottles and other topologies where struts share joints.
+@compute @workgroup_size(64)
+fn push_forces(@builtin(global_invocation_id) id: vec3<u32>) {
+    let idx = id.x;
+    if idx >= params.num_push { return; }
+
+    let a = push_alpha[idx];
+    let o = push_omega[idx];
+    let ideal = push_ideal[idx];
+    let k = push_k[idx];
+    let hm = push_half_mass[idx];
+
+    let pos_a = positions[a];
+    let pos_o = positions[o];
+
+    let dx = pos_o.x - pos_a.x;
+    let dy = pos_o.y - pos_a.y;
+    let dz = pos_o.z - pos_a.z;
+    let actual = sqrt(dx * dx + dy * dy + dz * dz);
+
+    if actual < 0.0001 { return; }
+
+    let strain = (actual - ideal) / ideal;
+    // No slack check — push intervals resist both compression and extension
+
+    let force_mag = k * strain * ideal;
+    let inv_actual = 1.0 / actual;
+    let fx = force_mag * dx * inv_actual;
+    let fy = force_mag * dy * inv_actual;
+    let fz = force_mag * dz * inv_actual;
+
+    let ifx = i32(fx * params.force_scale);
+    let ify = i32(fy * params.force_scale);
+    let ifz = i32(fz * params.force_scale);
+
+    // Add force to alpha (toward omega)
+    atomicAdd(&force_x[a], ifx);
+    atomicAdd(&force_y[a], ify);
+    atomicAdd(&force_z[a], ifz);
+
+    // Subtract force from omega (toward alpha)
+    atomicAdd(&force_x[o], -ifx);
+    atomicAdd(&force_y[o], -ify);
+    atomicAdd(&force_z[o], -ifz);
+
+    // Add push interval mass to endpoints
+    let ihm = i32(hm * MASS_SCALE);
+    atomicAdd(&masses[a], ihm);
+    atomicAdd(&masses[o], ihm);
 }

@@ -17,6 +17,8 @@ pub struct PhysicsConfig {
     pub settle_iterations: u32,
     pub settle_drag: f32,
     pub ambient_mass: f32,
+    pub gravity: f32,
+    pub ground_y: f32,
 }
 
 impl Default for PhysicsConfig {
@@ -31,6 +33,8 @@ impl Default for PhysicsConfig {
             settle_iterations: SETTLE_ITERATIONS,
             settle_drag: 100.0,
             ambient_mass: JOINT_AMBIENT_MASS,
+            gravity: GRAVITY,
+            ground_y: GROUND_Y,
         }
     }
 }
@@ -70,12 +74,17 @@ struct PhysicsParams {
     ground_y: f32,
     restitution: f32,
     speed_limit: f32,
+    num_push: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
 }
 
 pub struct PhysicsCompute {
     joint_bind_group: wgpu::BindGroup,
     interval_bind_group: wgpu::BindGroup,
     params_bind_group: wgpu::BindGroup,
+    push_bind_group: wgpu::BindGroup,
     half_kick_pipeline: wgpu::ComputePipeline,
     elastic_forces_pipeline: wgpu::ComputePipeline,
     rigid_mass_pipeline: wgpu::ComputePipeline,
@@ -83,11 +92,14 @@ pub struct PhysicsCompute {
     shake_pipeline: wgpu::ComputePipeline,
     rattle_pipeline: wgpu::ComputePipeline,
     ground_collision_pipeline: wgpu::ComputePipeline,
+    push_forces_pipeline: wgpu::ComputePipeline,
     position_buffer: wgpu::Buffer,
     staging_buffer: wgpu::Buffer,
     num_joints: u32,
     num_elastic: u32,
     num_rigid: u32,
+    num_push: u32,
+    use_spring_push: bool,
 }
 
 impl PhysicsCompute {
@@ -113,6 +125,10 @@ impl PhysicsCompute {
             ground_y: -1e6,         // ground far away — irrelevant
             restitution: 0.0,
             speed_limit: f32::MAX,  // no speed limit during settling
+            num_push: buffers.num_push(),
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
         };
         let physics = Self::with_params(device, buffers, settling_params);
 
@@ -138,10 +154,169 @@ impl PhysicsCompute {
         physics.read_positions(device)
     }
 
+    /// Approach-based settling for Klein bottles (and other random-start topologies).
+    /// Ideal lengths interpolate from actual → target over a small number of steps
+    /// to avoid violent forces from random initial placement.
+    ///
+    /// 20 approach steps × 2000 iterations each = 40k total approach iterations,
+    /// then 5000 final iterations at target lengths. Each step rebuilds the
+    /// PhysicsCompute with updated ideal lengths.
+    pub fn settle_with_approach(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        buffers: &mut TensegritySphereBuffers,
+        config: &PhysicsConfig,
+    ) -> Vec<[f32; 4]> {
+        // Save target ideal lengths
+        let target_elastic_ideal = buffers.elastic_ideal.clone();
+        let target_push_ideal = buffers.push_ideal.clone();
+
+        // Compute initial actual lengths for all intervals
+        let initial_elastic_actual: Vec<f32> = (0..buffers.elastic_alpha.len())
+            .map(|i| {
+                let a = buffers.elastic_alpha[i] as usize;
+                let o = buffers.elastic_omega[i] as usize;
+                let pa = buffers.positions[a];
+                let po = buffers.positions[o];
+                let dx = po[0] - pa[0];
+                let dy = po[1] - pa[1];
+                let dz = po[2] - pa[2];
+                (dx * dx + dy * dy + dz * dz).sqrt()
+            })
+            .collect();
+        let initial_push_actual: Vec<f32> = (0..buffers.push_alpha.len())
+            .map(|i| {
+                let a = buffers.push_alpha[i] as usize;
+                let o = buffers.push_omega[i] as usize;
+                let pa = buffers.positions[a];
+                let po = buffers.positions[o];
+                let dx = po[0] - pa[0];
+                let dy = po[1] - pa[1];
+                let dz = po[2] - pa[2];
+                (dx * dx + dy * dy + dz * dz).sqrt()
+            })
+            .collect();
+
+        let num_steps: u32 = 20;
+        let iters_per_step: u32 = 2000;
+        let gpu_chunk: u32 = 200; // max iterations per GPU submission
+
+        for step in 0..num_steps {
+            let progress = (step as f32 + 1.0) / num_steps as f32;
+
+            // Interpolate ideal lengths: initial_actual → target
+            for i in 0..buffers.elastic_ideal.len() {
+                buffers.elastic_ideal[i] = initial_elastic_actual[i]
+                    + (target_elastic_ideal[i] - initial_elastic_actual[i]) * progress;
+                buffers.elastic_k[i] = config.pull_k_at_1m / buffers.elastic_ideal[i];
+            }
+            for i in 0..buffers.push_ideal.len() {
+                buffers.push_ideal[i] = initial_push_actual[i]
+                    + (target_push_ideal[i] - initial_push_actual[i]) * progress;
+                buffers.push_k[i] = config.pull_k_at_1m / buffers.push_ideal[i];
+            }
+
+            let settling_params = PhysicsParams {
+                dt: config.dt,
+                gravity: 0.0,
+                drag: config.settle_drag,
+                viscosity: 0.0,
+                num_joints: buffers.num_joints(),
+                num_elastic: buffers.num_elastic(),
+                num_rigid: buffers.num_rigid(),
+                ambient_mass: config.ambient_mass,
+                force_scale: config.force_scale,
+                ground_y: -1e6,
+                restitution: 0.0,
+                speed_limit: f32::MAX,
+                num_push: buffers.num_push(),
+                _pad1: 0,
+                _pad2: 0,
+                _pad3: 0,
+            };
+            let physics = Self::with_params(device, buffers, settling_params);
+
+            // Run this step's iterations in GPU chunks
+            let mut remaining = iters_per_step;
+            while remaining > 0 {
+                let n = remaining.min(gpu_chunk);
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Approach settle"),
+                });
+                physics.dispatch(&mut encoder, n);
+                queue.submit(std::iter::once(encoder.finish()));
+                device.poll(wgpu::PollType::Wait).unwrap();
+                remaining -= n;
+            }
+
+            // Read back positions for the next step's buffer rebuild
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Approach readback"),
+            });
+            physics.copy_positions_to_staging(&mut encoder);
+            queue.submit(std::iter::once(encoder.finish()));
+            buffers.positions = physics.read_positions(device);
+            buffers.velocities = vec![[0.0f32; 4]; buffers.positions.len()];
+
+            log::info!("Approach settling: {:.0}%", progress * 100.0);
+        }
+
+        // Restore final target ideal lengths
+        buffers.elastic_ideal = target_elastic_ideal;
+        buffers.push_ideal = target_push_ideal;
+        for i in 0..buffers.elastic_k.len() {
+            buffers.elastic_k[i] = config.pull_k_at_1m / buffers.elastic_ideal[i];
+        }
+        for i in 0..buffers.push_k.len() {
+            buffers.push_k[i] = config.pull_k_at_1m / buffers.push_ideal[i];
+        }
+
+        // Final settling with target lengths
+        let settling_params = PhysicsParams {
+            dt: config.dt,
+            gravity: 0.0,
+            drag: config.settle_drag,
+            viscosity: 0.0,
+            num_joints: buffers.num_joints(),
+            num_elastic: buffers.num_elastic(),
+            num_rigid: buffers.num_rigid(),
+            ambient_mass: config.ambient_mass,
+            force_scale: config.force_scale,
+            ground_y: -1e6,
+            restitution: 0.0,
+            speed_limit: f32::MAX,
+            num_push: buffers.num_push(),
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+        };
+        let physics = Self::with_params(device, buffers, settling_params);
+        let final_settle: u32 = 5000;
+        let mut remaining = final_settle;
+        while remaining > 0 {
+            let n = remaining.min(gpu_chunk);
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Final settle"),
+            });
+            physics.dispatch(&mut encoder, n);
+            queue.submit(std::iter::once(encoder.finish()));
+            device.poll(wgpu::PollType::Wait).unwrap();
+            remaining -= n;
+        }
+        log::info!("Approach settling complete");
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Settle readback"),
+        });
+        physics.copy_positions_to_staging(&mut encoder);
+        queue.submit(std::iter::once(encoder.finish()));
+        physics.read_positions(device)
+    }
+
     pub fn new(device: &wgpu::Device, _queue: &wgpu::Queue, buffers: &TensegritySphereBuffers, config: &PhysicsConfig) -> Self {
         let params = PhysicsParams {
             dt: config.dt,
-            gravity: GRAVITY,
+            gravity: config.gravity,
             drag: config.drag,
             viscosity: VISCOSITY,
             num_joints: buffers.num_joints(),
@@ -149,9 +324,13 @@ impl PhysicsCompute {
             num_rigid: buffers.num_rigid(),
             ambient_mass: config.ambient_mass,
             force_scale: config.force_scale,
-            ground_y: GROUND_Y,
+            ground_y: config.ground_y,
             restitution: RESTITUTION,
             speed_limit: config.speed_limit,
+            num_push: buffers.num_push(),
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
         };
         Self::with_params(device, buffers, params)
     }
@@ -164,6 +343,8 @@ impl PhysicsCompute {
         let num_joints = params.num_joints;
         let num_elastic = params.num_elastic;
         let num_rigid = params.num_rigid;
+        let num_push = params.num_push;
+        let use_spring_push = buffers.use_spring_push;
 
         // Create GPU buffers
         let position_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -205,48 +386,23 @@ impl PhysicsCompute {
         });
 
         // Elastic interval buffers
-        let elastic_alpha_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Elastic Alpha"),
-            contents: bytemuck::cast_slice(&buffers.elastic_alpha),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let elastic_omega_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Elastic Omega"),
-            contents: bytemuck::cast_slice(&buffers.elastic_omega),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let elastic_ideal_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Elastic Ideal"),
-            contents: bytemuck::cast_slice(&buffers.elastic_ideal),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let elastic_k_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Elastic K"),
-            contents: bytemuck::cast_slice(&buffers.elastic_k),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+        let elastic_alpha_buf = create_storage_buffer(device, "Elastic Alpha", bytemuck::cast_slice(&buffers.elastic_alpha));
+        let elastic_omega_buf = create_storage_buffer(device, "Elastic Omega", bytemuck::cast_slice(&buffers.elastic_omega));
+        let elastic_ideal_buf = create_storage_buffer(device, "Elastic Ideal", bytemuck::cast_slice(&buffers.elastic_ideal));
+        let elastic_k_buf = create_storage_buffer(device, "Elastic K", bytemuck::cast_slice(&buffers.elastic_k));
 
         // Rigid interval buffers
-        let rigid_alpha_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Rigid Alpha"),
-            contents: bytemuck::cast_slice(&buffers.rigid_alpha),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let rigid_omega_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Rigid Omega"),
-            contents: bytemuck::cast_slice(&buffers.rigid_omega),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let rigid_length_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Rigid Length"),
-            contents: bytemuck::cast_slice(&buffers.rigid_length),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let rigid_half_mass_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Rigid Half Mass"),
-            contents: bytemuck::cast_slice(&buffers.rigid_half_mass),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+        let rigid_alpha_buf = create_storage_buffer(device, "Rigid Alpha", bytemuck::cast_slice(&buffers.rigid_alpha));
+        let rigid_omega_buf = create_storage_buffer(device, "Rigid Omega", bytemuck::cast_slice(&buffers.rigid_omega));
+        let rigid_length_buf = create_storage_buffer(device, "Rigid Length", bytemuck::cast_slice(&buffers.rigid_length));
+        let rigid_half_mass_buf = create_storage_buffer(device, "Rigid Half Mass", bytemuck::cast_slice(&buffers.rigid_half_mass));
+
+        // Push interval buffers (spring-based push for Klein etc.)
+        let push_alpha_buf = create_storage_buffer(device, "Push Alpha", bytemuck::cast_slice(&buffers.push_alpha));
+        let push_omega_buf = create_storage_buffer(device, "Push Omega", bytemuck::cast_slice(&buffers.push_omega));
+        let push_ideal_buf = create_storage_buffer(device, "Push Ideal", bytemuck::cast_slice(&buffers.push_ideal));
+        let push_k_buf = create_storage_buffer(device, "Push K", bytemuck::cast_slice(&buffers.push_k));
+        let push_half_mass_buf = create_storage_buffer(device, "Push Half Mass", bytemuck::cast_slice(&buffers.push_half_mass));
 
         let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Physics Params"),
@@ -303,6 +459,17 @@ impl PhysicsCompute {
             }],
         });
 
+        let push_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Push BGL"),
+            entries: &[
+                storage_entry(0, true), // push_alpha
+                storage_entry(1, true), // push_omega
+                storage_entry(2, true), // push_ideal
+                storage_entry(3, true), // push_k
+                storage_entry(4, true), // push_half_mass
+            ],
+        });
+
         // Bind groups
         let joint_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Joint BG"),
@@ -340,10 +507,22 @@ impl PhysicsCompute {
             ],
         });
 
+        let push_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Push BG"),
+            layout: &push_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: push_alpha_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: push_omega_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: push_ideal_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: push_k_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: push_half_mass_buf.as_entire_binding() },
+            ],
+        });
+
         // Pipeline layout
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Physics Pipeline Layout"),
-            bind_group_layouts: &[&joint_bgl, &interval_bgl, &params_bgl],
+            bind_group_layouts: &[&joint_bgl, &interval_bgl, &params_bgl, &push_bgl],
             push_constant_ranges: &[],
         });
 
@@ -353,7 +532,6 @@ impl PhysicsCompute {
             source: wgpu::ShaderSource::Wgsl(include_str!("physics.wgsl").into()),
         });
 
-        // Create 6 compute pipelines
         let make_pipeline = |entry: &str| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(entry),
@@ -372,11 +550,13 @@ impl PhysicsCompute {
         let shake_pipeline = make_pipeline("shake_constraints");
         let rattle_pipeline = make_pipeline("rattle_constraints");
         let ground_collision_pipeline = make_pipeline("ground_collision");
+        let push_forces_pipeline = make_pipeline("push_forces");
 
         Self {
             joint_bind_group,
             interval_bind_group,
             params_bind_group,
+            push_bind_group,
             half_kick_pipeline,
             elastic_forces_pipeline,
             rigid_mass_pipeline,
@@ -384,11 +564,14 @@ impl PhysicsCompute {
             shake_pipeline,
             rattle_pipeline,
             ground_collision_pipeline,
+            push_forces_pipeline,
             position_buffer,
             staging_buffer,
             num_joints,
             num_elastic,
             num_rigid,
+            num_push,
+            use_spring_push,
         }
     }
 
@@ -396,9 +579,8 @@ impl PhysicsCompute {
         let joint_groups = (self.num_joints + 63) / 64;
         let elastic_groups = if self.num_elastic > 0 { (self.num_elastic + 63) / 64 } else { 0 };
         let rigid_groups = if self.num_rigid > 0 { (self.num_rigid + 63) / 64 } else { 0 };
+        let push_groups = if self.num_push > 0 { (self.num_push + 63) / 64 } else { 0 };
 
-        // Single compute pass for all iterations — wgpu guarantees sequential
-        // execution with implicit storage barriers between dispatches.
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Physics"),
             timestamp_writes: None,
@@ -406,48 +588,79 @@ impl PhysicsCompute {
         pass.set_bind_group(0, &self.joint_bind_group, &[]);
         pass.set_bind_group(1, &self.interval_bind_group, &[]);
         pass.set_bind_group(2, &self.params_bind_group, &[]);
+        pass.set_bind_group(3, &self.push_bind_group, &[]);
 
-        for _ in 0..iterations {
-            // 1: Half kick + drift
-            pass.set_pipeline(&self.half_kick_pipeline);
-            pass.dispatch_workgroups(joint_groups, 1, 1);
+        if self.use_spring_push {
+            // Spring-push mode (Klein bottles etc.): no SHAKE/RATTLE needed
+            // 1. half_kick_and_drift
+            // 2. elastic_forces (cables)
+            // 3. push_forces (struts as springs)
+            // 4. second_half_kick (includes force reset)
+            // 5. ground_collision
+            for _ in 0..iterations {
+                pass.set_pipeline(&self.half_kick_pipeline);
+                pass.dispatch_workgroups(joint_groups, 1, 1);
 
-            // 2: SHAKE — correct positions to maintain rigid strut lengths
-            if rigid_groups > 0 {
-                pass.set_pipeline(&self.shake_pipeline);
-                pass.dispatch_workgroups(rigid_groups, 1, 1);
+                if elastic_groups > 0 {
+                    pass.set_pipeline(&self.elastic_forces_pipeline);
+                    pass.dispatch_workgroups(elastic_groups, 1, 1);
+                }
+
+                if push_groups > 0 {
+                    pass.set_pipeline(&self.push_forces_pipeline);
+                    pass.dispatch_workgroups(push_groups, 1, 1);
+                }
+
+                pass.set_pipeline(&self.second_half_kick_pipeline);
+                pass.dispatch_workgroups(joint_groups, 1, 1);
+
+                pass.set_pipeline(&self.ground_collision_pipeline);
+                pass.dispatch_workgroups(joint_groups, 1, 1);
             }
+        } else {
+            // SHAKE/RATTLE mode (geodesic spheres): rigid constraints
+            for _ in 0..iterations {
+                // 1: Half kick + drift
+                pass.set_pipeline(&self.half_kick_pipeline);
+                pass.dispatch_workgroups(joint_groups, 1, 1);
 
-            // 3: Elastic forces
-            if elastic_groups > 0 {
-                pass.set_pipeline(&self.elastic_forces_pipeline);
-                pass.dispatch_workgroups(elastic_groups, 1, 1);
-            }
+                // 2: SHAKE — correct positions to maintain rigid strut lengths
+                if rigid_groups > 0 {
+                    pass.set_pipeline(&self.shake_pipeline);
+                    pass.dispatch_workgroups(rigid_groups, 1, 1);
+                }
 
-            // 4: Rigid mass
-            if rigid_groups > 0 {
-                pass.set_pipeline(&self.rigid_mass_pipeline);
-                pass.dispatch_workgroups(rigid_groups, 1, 1);
-            }
+                // 3: Elastic forces
+                if elastic_groups > 0 {
+                    pass.set_pipeline(&self.elastic_forces_pipeline);
+                    pass.dispatch_workgroups(elastic_groups, 1, 1);
+                }
 
-            // 5: Second half kick (includes force reset for next iteration)
-            pass.set_pipeline(&self.second_half_kick_pipeline);
-            pass.dispatch_workgroups(joint_groups, 1, 1);
+                // 4: Rigid mass
+                if rigid_groups > 0 {
+                    pass.set_pipeline(&self.rigid_mass_pipeline);
+                    pass.dispatch_workgroups(rigid_groups, 1, 1);
+                }
 
-            // 6: RATTLE — project out velocity along rigid strut axes
-            if rigid_groups > 0 {
-                pass.set_pipeline(&self.rattle_pipeline);
-                pass.dispatch_workgroups(rigid_groups, 1, 1);
-            }
+                // 5: Second half kick (includes force reset for next iteration)
+                pass.set_pipeline(&self.second_half_kick_pipeline);
+                pass.dispatch_workgroups(joint_groups, 1, 1);
 
-            // 7: Ground collision
-            pass.set_pipeline(&self.ground_collision_pipeline);
-            pass.dispatch_workgroups(joint_groups, 1, 1);
+                // 6: RATTLE — project out velocity along rigid strut axes
+                if rigid_groups > 0 {
+                    pass.set_pipeline(&self.rattle_pipeline);
+                    pass.dispatch_workgroups(rigid_groups, 1, 1);
+                }
 
-            // 8: SHAKE again — ground collision moved joints, fix constraint violations
-            if rigid_groups > 0 {
-                pass.set_pipeline(&self.shake_pipeline);
-                pass.dispatch_workgroups(rigid_groups, 1, 1);
+                // 7: Ground collision
+                pass.set_pipeline(&self.ground_collision_pipeline);
+                pass.dispatch_workgroups(joint_groups, 1, 1);
+
+                // 8: SHAKE again — ground collision moved joints, fix constraint violations
+                if rigid_groups > 0 {
+                    pass.set_pipeline(&self.shake_pipeline);
+                    pass.dispatch_workgroups(rigid_groups, 1, 1);
+                }
             }
         }
         // pass drops here, ending the single compute pass
@@ -479,6 +692,17 @@ impl PhysicsCompute {
         positions
     }
 
+}
+
+/// Create a storage buffer from a slice, using a single zero element if the slice is empty.
+/// Some GPU backends don't support zero-size storage buffers in bind groups.
+fn create_storage_buffer(device: &wgpu::Device, label: &str, data: &[u8]) -> wgpu::Buffer {
+    let contents = if data.is_empty() { &[0u8; 4] } else { data };
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents,
+        usage: wgpu::BufferUsages::STORAGE,
+    })
 }
 
 fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {

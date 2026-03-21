@@ -33,6 +33,25 @@ pub const FREQ_BAR_HEIGHT: f32 = 36.0;
 pub const FREQ_BAR_RIGHT_MARGIN: f32 = 16.0;
 pub const FREQ_BAR_TOP: f32 = 12.0;
 
+/// Klein grid: 3 rows × 10 columns of (width, height) pairs.
+/// Width must be even, height must be odd. Max 300 in either dimension.
+/// Each row holds a constant product (≈ joint count), varying aspect ratio
+/// from tall/narrow (left) to wide/short (right).
+pub const KLEIN_GRID: &[&[(usize, usize)]] = &[
+    // Row 0: product ≈ 2000 (~1000 joints) — narrow to wide
+    &[(4, 299), (6, 251), (8, 201), (10, 163), (14, 127), (20, 101), (28, 71), (40, 51), (56, 37), (76, 27)],
+    // Row 1: product ≈ 8000 (~4000 joints)
+    &[(6, 299), (10, 251), (16, 201), (24, 163), (32, 127), (44, 101), (60, 77), (82, 55), (110, 41), (148, 31)],
+    // Row 2: product ≈ 24000 (~12000 joints)
+    &[(14, 299), (22, 253), (34, 201), (48, 163), (66, 127), (82, 101), (108, 77), (146, 57), (200, 41), (296, 29)],
+];
+pub const KLEIN_GRID_COLS: usize = 10;
+pub const KLEIN_GRID_ROWS: usize = 3;
+pub const KLEIN_BUTTON_WIDTH: f32 = 100.0;
+pub const KLEIN_ROW_HEIGHT: f32 = 30.0;
+pub const KLEIN_GRID_TOP: f32 = 54.0;
+pub const KLEIN_GRID_RIGHT_MARGIN: f32 = 16.0;
+
 /// X offset for each slider column
 const SLIDER_COL_1: f32 = 10.0;
 const SLIDER_COL_2: f32 = 70.0;
@@ -51,6 +70,7 @@ pub struct Hud {
     stiffness_slider: Buffer,
     pretension_slider: Buffer,
     freq_buffer: Buffer,
+    klein_grid_buffers: Vec<Buffer>,
     screen_width: f32,
     screen_height: f32,
 }
@@ -94,6 +114,15 @@ impl Hud {
         let mut freq_buffer = Buffer::new(&mut font_system, Metrics::new(22.0, FREQ_BAR_HEIGHT));
         freq_buffer.set_size(&mut font_system, Some(freq_width), Some(FREQ_BAR_HEIGHT + 4.0));
 
+        let klein_row_width = KLEIN_GRID_COLS as f32 * KLEIN_BUTTON_WIDTH + 20.0;
+        let klein_grid_buffers: Vec<Buffer> = (0..KLEIN_GRID_ROWS)
+            .map(|_| {
+                let mut buf = Buffer::new(&mut font_system, Metrics::new(18.0, KLEIN_ROW_HEIGHT));
+                buf.set_size(&mut font_system, Some(klein_row_width), Some(KLEIN_ROW_HEIGHT + 4.0));
+                buf
+            })
+            .collect();
+
         Self {
             font_system,
             swash_cache,
@@ -106,6 +135,7 @@ impl Hud {
             stiffness_slider,
             pretension_slider,
             freq_buffer,
+            klein_grid_buffers,
             screen_width: 1280.0,
             screen_height: 600.0,
         }
@@ -224,6 +254,45 @@ impl Hud {
         Self::build_slider(&mut self.pretension_slider, &mut self.font_system, t, label, PRETENSION_FILL, PRETENSION_LABEL, hovered);
     }
 
+    pub fn set_klein_grid(
+        &mut self,
+        current_width: usize,
+        current_height: usize,
+        hover: Option<(usize, usize)>, // (row, col)
+    ) {
+        for (row_idx, row) in KLEIN_GRID.iter().enumerate() {
+            let mut spans: Vec<(String, Attrs)> = Vec::new();
+            for (col_idx, &(w, h)) in row.iter().enumerate() {
+                let label = format!("{:>3}x{:<4}", w, h);
+                let color = if w == current_width && h == current_height {
+                    FREQ_ACTIVE
+                } else if hover == Some((row_idx, col_idx)) {
+                    FREQ_HOVER
+                } else {
+                    FREQ_NORMAL
+                };
+                spans.push((label, mono(color)));
+                // padding
+                if col_idx < row.len() - 1 {
+                    spans.push(("  ".to_string(), mono(FREQ_NORMAL)));
+                }
+            }
+            let borrowed: Vec<(&str, Attrs)> = spans.iter().map(|(s, a)| (s.as_str(), a.clone())).collect();
+            self.klein_grid_buffers[row_idx].set_rich_text(
+                &mut self.font_system,
+                borrowed,
+                &mono(FREQ_NORMAL),
+                Shaping::Basic,
+                None,
+            );
+            self.klein_grid_buffers[row_idx].shape_until_scroll(&mut self.font_system, false);
+        }
+    }
+
+    pub fn klein_grid_left(&self) -> f32 {
+        self.screen_width - KLEIN_GRID_COLS as f32 * KLEIN_BUTTON_WIDTH - KLEIN_GRID_RIGHT_MARGIN
+    }
+
     pub fn freq_bar_left(&self) -> f32 {
         self.screen_width - FREQ_CHOICES.len() as f32 * FREQ_BUTTON_WIDTH - FREQ_BAR_RIGHT_MARGIN
     }
@@ -280,14 +349,15 @@ impl Hud {
         let slider_top = (self.screen_height - slider_height) * 0.5;
 
         let freq_left = self.freq_bar_left();
+        let bounds = TextBounds { left: 0, top: 0, right: width as i32, bottom: height as i32 };
 
-        let text_areas: Vec<TextArea> = vec![
+        let mut text_areas: Vec<TextArea> = vec![
             TextArea {
                 buffer: &self.title_buffer,
                 left: 16.0,
                 top: 12.0,
                 scale: 1.0,
-                bounds: TextBounds { left: 0, top: 0, right: width as i32, bottom: height as i32 },
+                bounds,
                 default_color: TITLE_COLOR,
                 custom_glyphs: &[],
             },
@@ -296,7 +366,7 @@ impl Hud {
                 left: 16.0,
                 top: legend_top,
                 scale: 1.0,
-                bounds: TextBounds { left: 0, top: 0, right: width as i32, bottom: height as i32 },
+                bounds,
                 default_color: DESC_COLOR,
                 custom_glyphs: &[],
             },
@@ -305,7 +375,7 @@ impl Hud {
                 left: width as f32 - 350.0,
                 top: info_top,
                 scale: 1.0,
-                bounds: TextBounds { left: 0, top: 0, right: width as i32, bottom: height as i32 },
+                bounds,
                 default_color: INFO_COLOR,
                 custom_glyphs: &[],
             },
@@ -314,7 +384,7 @@ impl Hud {
                 left: freq_left,
                 top: FREQ_BAR_TOP,
                 scale: 1.0,
-                bounds: TextBounds { left: 0, top: 0, right: width as i32, bottom: height as i32 },
+                bounds,
                 default_color: FREQ_NORMAL,
                 custom_glyphs: &[],
             },
@@ -324,7 +394,7 @@ impl Hud {
                 left: SLIDER_COL_1,
                 top: slider_top,
                 scale: 1.0,
-                bounds: TextBounds { left: 0, top: 0, right: width as i32, bottom: height as i32 },
+                bounds,
                 default_color: SLIDER_TRACK,
                 custom_glyphs: &[],
             },
@@ -334,11 +404,25 @@ impl Hud {
                 left: SLIDER_COL_2,
                 top: slider_top,
                 scale: 1.0,
-                bounds: TextBounds { left: 0, top: 0, right: width as i32, bottom: height as i32 },
+                bounds,
                 default_color: SLIDER_TRACK,
                 custom_glyphs: &[],
             },
         ];
+
+        // Klein grid rows
+        let klein_left = self.klein_grid_left();
+        for (row_idx, buf) in self.klein_grid_buffers.iter().enumerate() {
+            text_areas.push(TextArea {
+                buffer: buf,
+                left: klein_left,
+                top: KLEIN_GRID_TOP + row_idx as f32 * KLEIN_ROW_HEIGHT,
+                scale: 1.0,
+                bounds,
+                default_color: FREQ_NORMAL,
+                custom_glyphs: &[],
+            });
+        }
 
         self.text_renderer
             .prepare(

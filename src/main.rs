@@ -2,32 +2,23 @@ mod app;
 mod camera;
 mod constants;
 mod gpu;
+mod klein;
 mod sphere;
 mod tensegrity;
 
-use clap::Parser;
 use winit::event_loop::EventLoop;
 
-#[derive(Parser)]
-#[command(name = "chopstix", about = "GPU tensegrity sphere experiment")]
-struct Args {
-    /// Sphere frequency (geodesic subdivision level)
-    #[arg(short, long, default_value_t = 3)]
-    frequency: usize,
+#[derive(Clone, Debug)]
+pub enum ShapeConfig {
+    Sphere { frequency: usize },
+    Klein { width: usize, height: usize, shift: usize },
 }
 
 fn main() {
     env_logger::init();
-    let args = Args::parse();
-
-    if args.frequency < 1 {
-        eprintln!("Frequency must be at least 1");
-        std::process::exit(1);
-    }
-
-    log::info!("Starting chopstix with frequency {}", args.frequency);
+    log::info!("Starting chopstix");
 
     let event_loop = EventLoop::new().expect("Failed to create event loop");
-    let mut app = app::App::new(args.frequency);
+    let mut app = app::App::new(ShapeConfig::Sphere { frequency: 3 });
     event_loop.run_app(&mut app).expect("Event loop error");
 }

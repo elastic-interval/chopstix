@@ -39,6 +39,8 @@ pub struct Renderer {
     elastic_omega: Vec<u32>,
     rigid_alpha: Vec<u32>,
     rigid_omega: Vec<u32>,
+    push_alpha: Vec<u32>,
+    push_omega: Vec<u32>,
     radius_scale: f32,
 }
 
@@ -208,6 +210,8 @@ impl Renderer {
             elastic_omega: buffers.elastic_omega.clone(),
             rigid_alpha: buffers.rigid_alpha.clone(),
             rigid_omega: buffers.rigid_omega.clone(),
+            push_alpha: buffers.push_alpha.clone(),
+            push_omega: buffers.push_omega.clone(),
             radius_scale: 3.0 / frequency as f32,
         }
     }
@@ -217,12 +221,26 @@ impl Renderer {
     }
 
     pub fn update_instances(&mut self, device: &wgpu::Device, positions: &[[f32; 4]]) {
-        let mut instances = Vec::with_capacity(self.rigid_alpha.len() + self.elastic_alpha.len());
+        let total_struts = self.rigid_alpha.len() + self.push_alpha.len();
+        let mut instances = Vec::with_capacity(total_struts + self.elastic_alpha.len());
 
-        // Struts (rigid) - silver, thick
+        // Rigid struts (SHAKE/RATTLE mode) - silver, thick
         for i in 0..self.rigid_alpha.len() {
             let a = self.rigid_alpha[i] as usize;
             let o = self.rigid_omega[i] as usize;
+            instances.push(CylinderInstance {
+                start: [positions[a][0], positions[a][1], positions[a][2]],
+                radius_factor: 3.0 * self.radius_scale,
+                end: [positions[o][0], positions[o][1], positions[o][2]],
+                material_type: 0, // Push
+                color: [0.75, 0.75, 0.78, 1.0], // Silver
+            });
+        }
+
+        // Spring-push struts (Klein etc.) - silver, thick
+        for i in 0..self.push_alpha.len() {
+            let a = self.push_alpha[i] as usize;
+            let o = self.push_omega[i] as usize;
             instances.push(CylinderInstance {
                 start: [positions[a][0], positions[a][1], positions[a][2]],
                 radius_factor: 3.0 * self.radius_scale,
@@ -300,6 +318,8 @@ impl Renderer {
         self.elastic_omega = buffers.elastic_omega.clone();
         self.rigid_alpha = buffers.rigid_alpha.clone();
         self.rigid_omega = buffers.rigid_omega.clone();
+        self.push_alpha = buffers.push_alpha.clone();
+        self.push_omega = buffers.push_omega.clone();
         self.radius_scale = 3.0 / frequency as f32;
     }
 }
