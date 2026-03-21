@@ -299,26 +299,7 @@ impl ApplicationHandler for App {
                         }
                         _ => {}
                     },
-                    Mode::Stiffness => match &logical_key {
-                        Key::Character(c) if c.as_str() == "=" || c.as_str() == "+" => {
-                            state.pull_k_at_1m = (state.pull_k_at_1m * 1.1).min(1e10);
-                            App::update_stiffness(state);
-                        }
-                        Key::Character(c) if c.as_str() == "-" => {
-                            state.pull_k_at_1m = (state.pull_k_at_1m / 1.1).max(1e3);
-                            App::update_stiffness(state);
-                        }
-                        _ => {}
-                    },
-                    Mode::Pretension => match &logical_key {
-                        Key::Character(c) if c.as_str() == "=" || c.as_str() == "+" => {
-                            App::adjust_pretension(state, 0.99); // tighten
-                        }
-                        Key::Character(c) if c.as_str() == "-" => {
-                            App::adjust_pretension(state, 1.01); // loosen
-                        }
-                        _ => {}
-                    },
+                    Mode::Stiffness | Mode::Pretension => {}
                 }
             }
             WindowEvent::MouseInput {
@@ -356,15 +337,14 @@ impl ApplicationHandler for App {
                         state.camera.scroll(scroll);
                     }
                     Mode::Stiffness => {
-                        // Scroll adjusts stiffness — ~2% per unit, very gradual
-                        let factor = 1.02_f32.powf(scroll);
+                        // Log-scale stiffness: ~50% per scroll unit
+                        let factor = 1.5_f32.powf(scroll);
                         state.pull_k_at_1m = (state.pull_k_at_1m * factor).clamp(1e3, 1e10);
                         App::update_stiffness(state);
                     }
                     Mode::Pretension => {
-                        // Scroll down = tighten (shorter cables), up = loosen
-                        // ~0.2% per scroll unit — very gradual approach
-                        let factor = 0.998_f32.powf(scroll);
+                        // Pretension: ~5% per scroll unit
+                        let factor = 0.95_f32.powf(scroll);
                         App::adjust_pretension(state, factor);
                     }
                 }
@@ -416,22 +396,31 @@ impl ApplicationHandler for App {
                         }
                         Mode::Stiffness => {
                             state.hud.set_legend(&[
-                                ("scroll", &format!("adjust K  {:.2e}", state.pull_k_at_1m)),
-                                ("+/-", "adjust K (10% steps)"),
+                                ("scroll", "adjust stiffness"),
                                 ("S", "back to orbit"),
                                 ("Esc", "back to orbit"),
                                 ("Space", if state.paused { "resume" } else { "pause" }),
                             ]);
+                            // Log-scale slider: K range 1e3..1e10
+                            let t = (state.pull_k_at_1m.log10() - 3.0) / 7.0;
+                            state.hud.set_slider(t, &format!("{:.1e}", state.pull_k_at_1m));
                         }
                         Mode::Pretension => {
                             state.hud.set_legend(&[
-                                ("scroll", &format!("adjust pretension  {:.1}%", (1.0 - state.pretension) * 100.0)),
-                                ("+/-", "tighten / loosen (1% steps)"),
+                                ("scroll", "adjust pretension"),
                                 ("P", "back to orbit"),
                                 ("Esc", "back to orbit"),
                                 ("Space", if state.paused { "resume" } else { "pause" }),
                             ]);
+                            // Linear slider: pretension 0.5..1.0 (50%..0%)
+                            let t = (1.0 - state.pretension) / 0.5; // 0% → 0.0, 50% → 1.0
+                            state.hud.set_slider(t, &format!("{:.1}%", (1.0 - state.pretension) * 100.0));
                         }
+                    }
+
+                    // Slider: hide in orbit mode
+                    if state.mode == Mode::Orbit {
+                        state.hud.hide_slider();
                     }
 
                     // Info: stats (bottom-right)

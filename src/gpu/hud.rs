@@ -8,10 +8,15 @@ const VALUE_COLOR: Color = Color::rgb(200, 230, 255);
 const KEY_COLOR: Color = Color::rgb(140, 200, 255);
 const DESC_COLOR: Color = Color::rgb(200, 200, 190);
 const INFO_COLOR: Color = Color::rgb(160, 160, 150);
+const SLIDER_TRACK: Color = Color::rgb(60, 60, 55);
+const SLIDER_FILL: Color = Color::rgb(140, 200, 255);
+const SLIDER_LABEL: Color = Color::rgb(200, 220, 255);
 
 fn mono(color: Color) -> Attrs<'static> {
     Attrs::new().family(Family::Monospace).color(color)
 }
+
+const SLIDER_STEPS: usize = 30;
 
 pub struct Hud {
     font_system: FontSystem,
@@ -22,7 +27,9 @@ pub struct Hud {
     title_buffer: Buffer,
     legend_buffer: Buffer,
     info_buffer: Buffer,
+    slider_buffer: Buffer,
     screen_height: f32,
+    show_slider: bool,
 }
 
 impl Hud {
@@ -54,6 +61,9 @@ impl Hud {
         let mut info_buffer = Buffer::new(&mut font_system, Metrics::new(18.0, 24.0));
         info_buffer.set_size(&mut font_system, Some(600.0), Some(100.0));
 
+        let mut slider_buffer = Buffer::new(&mut font_system, Metrics::new(28.0, 32.0));
+        slider_buffer.set_size(&mut font_system, Some(200.0), Some(1200.0));
+
         Self {
             font_system,
             swash_cache,
@@ -63,11 +73,12 @@ impl Hud {
             title_buffer,
             legend_buffer,
             info_buffer,
+            slider_buffer,
             screen_height: 600.0,
+            show_slider: false,
         }
     }
 
-    /// Top-left: mode name and current value
     pub fn set_title(&mut self, mode: &str, value: &str) {
         let spans: Vec<(&str, Attrs)> = vec![
             (mode, mono(TITLE_COLOR)),
@@ -84,7 +95,6 @@ impl Hud {
         self.title_buffer.shape_until_scroll(&mut self.font_system, false);
     }
 
-    /// Bottom-left: available keys in current mode
     pub fn set_legend(&mut self, lines: &[(&str, &str)]) {
         let mut spans: Vec<(&str, Attrs)> = Vec::new();
         for (i, (key, desc)) in lines.iter().enumerate() {
@@ -109,7 +119,6 @@ impl Hud {
         self.legend_buffer.shape_until_scroll(&mut self.font_system, false);
     }
 
-    /// Bottom-right area: stats
     pub fn set_info(&mut self, text: &str) {
         self.info_buffer.set_text(
             &mut self.font_system,
@@ -118,6 +127,46 @@ impl Hud {
             Shaping::Basic,
         );
         self.info_buffer.shape_until_scroll(&mut self.font_system, false);
+    }
+
+    /// Show a vertical slider. `t` is 0.0..1.0 position, `label` shows the value.
+    pub fn set_slider(&mut self, t: f32, label: &str) {
+        self.show_slider = true;
+        let t = t.clamp(0.0, 1.0);
+        let filled = (t * SLIDER_STEPS as f32).round() as usize;
+
+        // Build vertical slider: top = max, bottom = min
+        // Each line is one step of the track
+        let mut spans: Vec<(String, Attrs)> = Vec::new();
+        for i in (0..SLIDER_STEPS).rev() {
+            if i < SLIDER_STEPS - 1 {
+                spans.push(("\n".to_string(), mono(SLIDER_TRACK)));
+            }
+            if i == filled {
+                spans.push((" \u{25C0} ".to_string(), mono(SLIDER_FILL))); // ◀ marker
+            } else if i <= filled {
+                spans.push((" \u{2503} ".to_string(), mono(SLIDER_FILL))); // ┃ filled
+            } else {
+                spans.push((" \u{2502} ".to_string(), mono(SLIDER_TRACK))); // │ empty
+            }
+        }
+        // Label at bottom
+        spans.push(("\n".to_string(), mono(SLIDER_LABEL)));
+        spans.push((label.to_string(), mono(SLIDER_LABEL)));
+
+        let borrowed_spans: Vec<(&str, Attrs)> = spans.iter().map(|(s, a)| (s.as_str(), a.clone())).collect();
+        self.slider_buffer.set_rich_text(
+            &mut self.font_system,
+            borrowed_spans,
+            &mono(SLIDER_TRACK),
+            Shaping::Basic,
+            None,
+        );
+        self.slider_buffer.shape_until_scroll(&mut self.font_system, false);
+    }
+
+    pub fn hide_slider(&mut self) {
+        self.show_slider = false;
     }
 
     pub fn prepare(
@@ -138,8 +187,12 @@ impl Hud {
         let info_height = info_lines * 24.0;
         let info_top = self.screen_height - info_height - 16.0;
 
-        let text_areas = [
-            // Title: top-left
+        // Slider centered vertically on left edge
+        let slider_lines = self.slider_buffer.lines.len() as f32;
+        let slider_height = slider_lines * 32.0;
+        let slider_top = (self.screen_height - slider_height) * 0.5;
+
+        let mut text_areas: Vec<TextArea> = vec![
             TextArea {
                 buffer: &self.title_buffer,
                 left: 16.0,
@@ -149,7 +202,6 @@ impl Hud {
                 default_color: TITLE_COLOR,
                 custom_glyphs: &[],
             },
-            // Legend: bottom-left
             TextArea {
                 buffer: &self.legend_buffer,
                 left: 16.0,
@@ -159,7 +211,6 @@ impl Hud {
                 default_color: DESC_COLOR,
                 custom_glyphs: &[],
             },
-            // Info: bottom-right
             TextArea {
                 buffer: &self.info_buffer,
                 left: width as f32 - 350.0,
@@ -170,6 +221,18 @@ impl Hud {
                 custom_glyphs: &[],
             },
         ];
+
+        if self.show_slider {
+            text_areas.push(TextArea {
+                buffer: &self.slider_buffer,
+                left: 6.0,
+                top: slider_top,
+                scale: 1.0,
+                bounds: TextBounds { left: 0, top: 0, right: width as i32, bottom: height as i32 },
+                default_color: SLIDER_TRACK,
+                custom_glyphs: &[],
+            });
+        }
 
         self.text_renderer
             .prepare(
