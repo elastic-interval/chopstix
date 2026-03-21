@@ -337,14 +337,13 @@ impl ApplicationHandler for App {
                         state.camera.scroll(scroll);
                     }
                     Mode::Stiffness => {
-                        // Log-scale stiffness: ~50% per scroll unit
-                        let factor = 1.5_f32.powf(scroll);
+                        let factor = 1.2_f32.powf(scroll);
                         state.pull_k_at_1m = (state.pull_k_at_1m * factor).clamp(1e3, 1e10);
                         App::update_stiffness(state);
                     }
                     Mode::Pretension => {
-                        // Pretension: ~5% per scroll unit
-                        let factor = 0.95_f32.powf(scroll);
+                        // Scroll up (negative on macOS natural) = tighten
+                        let factor = 1.03_f32.powf(scroll);
                         App::adjust_pretension(state, factor);
                     }
                 }
