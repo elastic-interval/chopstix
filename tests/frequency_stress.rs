@@ -188,9 +188,21 @@ fn run_frequency(
 }
 
 struct Scenario {
-    name: &'static str,
-    config: PhysicsConfig,
+    name: String,
     max_frequency: usize,
+    /// If true, config is scaled per-frequency via scaled_for_frequency()
+    scale_with_freq: bool,
+    base_config: PhysicsConfig,
+}
+
+impl Scenario {
+    fn config_for_freq(&self, freq: usize) -> PhysicsConfig {
+        if self.scale_with_freq {
+            self.base_config.clone().scaled_for_frequency(freq)
+        } else {
+            self.base_config.clone()
+        }
+    }
 }
 
 #[test]
@@ -201,70 +213,55 @@ fn frequency_sweep() {
 
     let scenarios = vec![
         Scenario {
-            name: "Baseline (current defaults)",
-            config: PhysicsConfig::default(),
-            max_frequency: 20,
+            name: "Fixed dt (baseline)".into(),
+            base_config: PhysicsConfig::default(),
+            max_frequency: 40,
+            scale_with_freq: false,
         },
         Scenario {
-            name: "Higher iterations (dt=0.1ms, iter=200)",
-            config: PhysicsConfig {
-                dt: 0.1e-3,
-                iterations_per_frame: 200,
-                ..PhysicsConfig::default()
-            },
-            max_frequency: 20,
-        },
-        Scenario {
-            name: "Match tensegrity-lab (dt=60us, iter=333)",
-            config: PhysicsConfig {
-                dt: 60e-6,
-                iterations_per_frame: 333,
-                ..PhysicsConfig::default()
-            },
-            max_frequency: 20,
-        },
-        Scenario {
-            name: "Stiffer cables (K=1e8, dt=60us, iter=333)",
-            config: PhysicsConfig {
-                dt: 60e-6,
-                iterations_per_frame: 333,
-                pull_k_at_1m: 1e8,
-                ..PhysicsConfig::default()
-            },
-            max_frequency: 20,
+            name: "Scaled for frequency".into(),
+            base_config: PhysicsConfig::default(),
+            max_frequency: 40,
+            scale_with_freq: true,
         },
     ];
 
-    // Collect results: scenario_index → vec of (freq, result, elapsed)
-    let mut all_results: Vec<Vec<(usize, RunResult, f64)>> = Vec::new();
+    // Collect results: scenario_index → vec of (freq, result, elapsed, dt_used, iter_used)
+    let mut all_results: Vec<Vec<(usize, RunResult, f64, f32, u32)>> = Vec::new();
 
     for (si, scenario) in scenarios.iter().enumerate() {
-        println!("\n{}", "=".repeat(60));
+        println!("\n{}", "=".repeat(70));
         println!("Scenario {}: {}", si + 1, scenario.name);
-        println!("  dt={:.6}s, iter={}, sim_time/frame={:.3}ms, K={:.0e}, force_scale={:.0}",
-            scenario.config.dt,
-            scenario.config.iterations_per_frame,
-            scenario.config.dt * scenario.config.iterations_per_frame as f32 * 1000.0,
-            scenario.config.pull_k_at_1m,
-            scenario.config.force_scale,
-        );
+        if scenario.scale_with_freq {
+            println!("  base dt={:.6}s, base iter={}, scaled per frequency",
+                scenario.base_config.dt, scenario.base_config.iterations_per_frame);
+        } else {
+            println!("  dt={:.6}s, iter={} (fixed)",
+                scenario.base_config.dt, scenario.base_config.iterations_per_frame);
+        }
+        println!("  K={:.0e}, force_scale={:.0}",
+            scenario.base_config.pull_k_at_1m, scenario.base_config.force_scale);
         println!();
 
-        let mut results: Vec<(usize, RunResult, f64)> = Vec::new();
+        let mut results: Vec<(usize, RunResult, f64, f32, u32)> = Vec::new();
 
-        for freq in 1..=scenario.max_frequency {
-            let buffers = tensegrity::generate_sphere_with_k(freq, SPHERE_RADIUS, scenario.config.pull_k_at_1m);
-            print!("  freq={:2} ({:4}j, {:3}s, {:4}c) ... ",
-                freq, buffers.num_joints(), buffers.num_rigid(), buffers.num_elastic());
+        let freqs: Vec<usize> = (1..=scenario.max_frequency)
+            .filter(|&f| f <= 10 || f % 2 == 0)
+            .collect();
+        for freq in freqs {
+            let config = scenario.config_for_freq(freq);
+            let buffers = tensegrity::generate_sphere_with_k(freq, SPHERE_RADIUS, config.pull_k_at_1m);
+            print!("  freq={:2} ({:5}j) dt={:.0}us iter={:4} ... ",
+                freq, buffers.num_joints(), config.dt * 1e6, config.iterations_per_frame);
 
             let t0 = Instant::now();
-            let result = run_frequency(&device, &queue, freq, &scenario.config, max_frames);
+            let result = run_frequency(&device, &queue, freq, &config, max_frames);
             let elapsed = t0.elapsed().as_secs_f64();
 
             println!("{} ({:.2}s) — {}", result_tag(&result), elapsed, result);
 
             let exploded = matches!(result, RunResult::Exploded { .. });
-            results.push((freq, result, elapsed));
+            results.push((freq, result, elapsed, config.dt, config.iterations_per_frame));
 
             if exploded {
                 println!("  Stopping sweep — explosion at frequency {}", freq);
@@ -275,33 +272,33 @@ fn frequency_sweep() {
     }
 
     // Summary table
-    println!("\n\n{}", "=".repeat(80));
+    println!("\n\n{}", "=".repeat(90));
     println!("COMPARISON TABLE");
-    println!("{}", "=".repeat(80));
+    println!("{}", "=".repeat(90));
 
     // Header
     print!("{:>6}", "freq");
     for scenario in &scenarios {
-        print!(" | {:^20}", scenario.name.chars().take(20).collect::<String>());
+        print!(" | {:^25}", &scenario.name[..scenario.name.len().min(25)]);
     }
     println!();
     print!("{:->6}", "");
     for _ in &scenarios {
-        print!("-+-{:->20}", "");
+        print!("-+-{:->25}", "");
     }
     println!();
 
     // Find max frequency tested across all scenarios
     let max_freq_tested = all_results.iter()
-        .flat_map(|r| r.iter().map(|(f, _, _)| *f))
+        .flat_map(|r| r.iter().map(|(f, _, _, _, _)| *f))
         .max()
         .unwrap_or(0);
 
     for freq in 1..=max_freq_tested {
         print!("{:>6}", freq);
         for results in &all_results {
-            if let Some((_, result, elapsed)) = results.iter().find(|(f, _, _)| *f == freq) {
-                print!(" | {:>4} {:>6.2}s {:>7}", result_tag(result), elapsed,
+            if let Some((_, result, elapsed, _, _)) = results.iter().find(|(f, _, _, _, _)| *f == freq) {
+                print!(" | {:>4} {:>6.2}s {:>12}", result_tag(result), elapsed,
                     match result {
                         RunResult::Settled { final_spread, .. } => format!("r={:.1}", final_spread),
                         RunResult::Exploded { frame, .. } => format!("f={}", frame),
@@ -310,7 +307,7 @@ fn frequency_sweep() {
                     }
                 );
             } else {
-                print!(" | {:>20}", "—");
+                print!(" | {:>25}", "—");
             }
         }
         println!();
@@ -321,11 +318,11 @@ fn frequency_sweep() {
     print!("{:>6}", "max");
     for results in &all_results {
         let max_stable = results.iter()
-            .filter(|(_, r, _)| matches!(r, RunResult::Settled { .. } | RunResult::TimedOut { .. }))
-            .map(|(f, _, _)| *f)
+            .filter(|(_, r, _, _, _)| matches!(r, RunResult::Settled { .. } | RunResult::TimedOut { .. }))
+            .map(|(f, _, _, _, _)| *f)
             .max()
             .unwrap_or(0);
-        print!(" | {:^20}", format!("freq {}", max_stable));
+        print!(" | {:^25}", format!("freq {}", max_stable));
     }
     println!();
 }

@@ -209,9 +209,7 @@ pub fn generate_sphere_with_k(frequency: usize, radius: f32, pull_k_at_1m: f32) 
             }
         }
     }
-    if slack_count > 0 {
-        log::warn!("{} circumference cables would have been slack with old ideal lengths", slack_count);
-    }
+    let _ = slack_count;
 
     // Shrink initial positions so cables start near their ideal (at rest)
     // and struts start slightly compressed (pushing outward) — this is the

@@ -6,6 +6,7 @@ use crate::tensegrity::TensegritySphereBuffers;
 /// Runtime-configurable physics parameters.
 /// Constants in `constants.rs` become the defaults.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct PhysicsConfig {
     pub dt: f32,
     pub iterations_per_frame: u32,
@@ -15,6 +16,7 @@ pub struct PhysicsConfig {
     pub speed_limit: f32,
     pub settle_iterations: u32,
     pub settle_drag: f32,
+    pub ambient_mass: f32,
 }
 
 impl Default for PhysicsConfig {
@@ -28,7 +30,28 @@ impl Default for PhysicsConfig {
             speed_limit: SPEED_LIMIT,
             settle_iterations: SETTLE_ITERATIONS,
             settle_drag: 100.0,
+            ambient_mass: JOINT_AMBIENT_MASS,
         }
+    }
+}
+
+impl PhysicsConfig {
+    /// Scale dt and iterations for a given geodesic frequency.
+    ///
+    /// Higher frequency → shorter cables → stiffer system → smaller dt needed.
+    /// Baseline is stable through ~freq 30, so scaling only kicks in above
+    /// a reference frequency (20). Below that, no penalty.
+    /// Above it, dt scales as 1/sqrt(freq/ref) with iterations scaled up to match.
+    const FREQ_REF: f32 = 20.0;
+
+    pub fn scaled_for_frequency(mut self, frequency: usize) -> Self {
+        let f = frequency as f32;
+        if f > Self::FREQ_REF {
+            let scale = (f / Self::FREQ_REF).sqrt();
+            self.dt /= scale;
+            self.iterations_per_frame = (self.iterations_per_frame as f32 * scale).ceil() as u32;
+        }
+        self
     }
 }
 
@@ -85,7 +108,7 @@ impl PhysicsCompute {
             num_joints,
             num_elastic: buffers.num_elastic(),
             num_rigid: buffers.num_rigid(),
-            ambient_mass: JOINT_AMBIENT_MASS,
+            ambient_mass: config.ambient_mass,
             force_scale: config.force_scale,
             ground_y: -1e6,         // ground far away — irrelevant
             restitution: 0.0,
@@ -124,7 +147,7 @@ impl PhysicsCompute {
             num_joints: buffers.num_joints(),
             num_elastic: buffers.num_elastic(),
             num_rigid: buffers.num_rigid(),
-            ambient_mass: JOINT_AMBIENT_MASS,
+            ambient_mass: config.ambient_mass,
             force_scale: config.force_scale,
             ground_y: GROUND_Y,
             restitution: RESTITUTION,
@@ -173,7 +196,7 @@ impl PhysicsCompute {
         });
 
         // Mass accumulator (atomic i32, initialized to ambient_mass * MASS_SCALE)
-        let ambient_i32 = (JOINT_AMBIENT_MASS * 1e4) as i32;
+        let ambient_i32 = (params.ambient_mass * 1e4) as i32;
         let mass_init = vec![ambient_i32; num_joints as usize];
         let mass_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Masses"),

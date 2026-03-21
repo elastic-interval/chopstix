@@ -58,8 +58,10 @@ impl Camera {
         self.last_mouse = Some((x, y));
     }
 
+    /// Drift toward the target — gentle magnetism rather than hard lock.
     pub fn track_target(&mut self, target: Vec3) {
-        let offset = target - self.look_at;
+        let ease = 0.03; // blend factor per call — lower = lazier tracking
+        let offset = (target - self.look_at) * ease;
         self.look_at += offset;
         self.position += offset;
     }
