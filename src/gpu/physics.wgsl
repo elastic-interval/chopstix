@@ -60,8 +60,15 @@ fn half_kick_and_drift(@builtin(global_invocation_id) id: vec3<u32>) {
     let m = f32(atomicLoad(&masses[idx])) / MASS_SCALE;
 
     var vel = velocities[idx];
-    // If this joint was nuked, keep it frozen
-    if vel.w > 0.5 { return; }
+    // If this joint was nuked, give it another chance — clear flag, zero velocity
+    if vel.w > 0.5 {
+        vel = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        velocities[idx] = vel;
+        var pos = positions[idx];
+        pos.w = 0.0;
+        positions[idx] = pos;
+        return; // skip this iteration, participate next
+    }
 
     let inv_m = select(0.0, 1.0 / m, m > 0.0);
     vel.x += 0.5 * fx * inv_m * params.dt;

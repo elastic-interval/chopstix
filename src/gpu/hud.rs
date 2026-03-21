@@ -11,12 +11,33 @@ const INFO_COLOR: Color = Color::rgb(160, 160, 150);
 const SLIDER_TRACK: Color = Color::rgb(60, 60, 55);
 const SLIDER_FILL: Color = Color::rgb(140, 200, 255);
 const SLIDER_LABEL: Color = Color::rgb(200, 220, 255);
+const PRETENSION_FILL: Color = Color::rgb(200, 180, 100);
+const PRETENSION_LABEL: Color = Color::rgb(230, 210, 140);
+const FREQ_NORMAL: Color = Color::rgb(100, 100, 90);
+const FREQ_ACTIVE: Color = Color::rgb(255, 255, 255);
+const FREQ_HOVER: Color = Color::rgb(180, 200, 255);
 
 fn mono(color: Color) -> Attrs<'static> {
     Attrs::new().family(Family::Monospace).color(color)
 }
 
 const SLIDER_STEPS: usize = 30;
+
+pub const FREQ_CHOICES: &[usize] = &[
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    15, 20, 25, 30, 35, 40, 45, 50, 55, 60,
+];
+
+pub const FREQ_BUTTON_WIDTH: f32 = 52.0;
+pub const FREQ_BAR_HEIGHT: f32 = 36.0;
+pub const FREQ_BAR_RIGHT_MARGIN: f32 = 16.0;
+pub const FREQ_BAR_TOP: f32 = 12.0;
+
+/// X offset for each slider column
+const SLIDER_COL_1: f32 = 10.0;
+const SLIDER_COL_2: f32 = 70.0;
+/// Total width of the slider hit zone
+const SLIDER_COL_WIDTH: f32 = 55.0;
 
 pub struct Hud {
     font_system: FontSystem,
@@ -27,9 +48,11 @@ pub struct Hud {
     title_buffer: Buffer,
     legend_buffer: Buffer,
     info_buffer: Buffer,
-    slider_buffer: Buffer,
+    stiffness_slider: Buffer,
+    pretension_slider: Buffer,
+    freq_buffer: Buffer,
+    screen_width: f32,
     screen_height: f32,
-    show_slider: bool,
 }
 
 impl Hud {
@@ -61,8 +84,15 @@ impl Hud {
         let mut info_buffer = Buffer::new(&mut font_system, Metrics::new(18.0, 24.0));
         info_buffer.set_size(&mut font_system, Some(600.0), Some(100.0));
 
-        let mut slider_buffer = Buffer::new(&mut font_system, Metrics::new(28.0, 32.0));
-        slider_buffer.set_size(&mut font_system, Some(200.0), Some(1200.0));
+        let slider_metrics = Metrics::new(22.0, 26.0);
+        let mut stiffness_slider = Buffer::new(&mut font_system, slider_metrics);
+        stiffness_slider.set_size(&mut font_system, Some(SLIDER_COL_WIDTH), Some(1000.0));
+        let mut pretension_slider = Buffer::new(&mut font_system, slider_metrics);
+        pretension_slider.set_size(&mut font_system, Some(SLIDER_COL_WIDTH), Some(1000.0));
+
+        let freq_width = FREQ_CHOICES.len() as f32 * FREQ_BUTTON_WIDTH + 20.0;
+        let mut freq_buffer = Buffer::new(&mut font_system, Metrics::new(22.0, FREQ_BAR_HEIGHT));
+        freq_buffer.set_size(&mut font_system, Some(freq_width), Some(FREQ_BAR_HEIGHT + 4.0));
 
         Self {
             font_system,
@@ -73,9 +103,11 @@ impl Hud {
             title_buffer,
             legend_buffer,
             info_buffer,
-            slider_buffer,
+            stiffness_slider,
+            pretension_slider,
+            freq_buffer,
+            screen_width: 1280.0,
             screen_height: 600.0,
-            show_slider: false,
         }
     }
 
@@ -129,44 +161,99 @@ impl Hud {
         self.info_buffer.shape_until_scroll(&mut self.font_system, false);
     }
 
-    /// Show a vertical slider. `t` is 0.0..1.0 position, `label` shows the value.
-    pub fn set_slider(&mut self, t: f32, label: &str) {
-        self.show_slider = true;
+    pub fn set_freq_bar(&mut self, current: usize, hover_index: Option<usize>) {
+        let mut spans: Vec<(String, Attrs)> = Vec::new();
+        for (i, &freq) in FREQ_CHOICES.iter().enumerate() {
+            let label = format!("{:>3} ", freq);
+            let color = if freq == current {
+                FREQ_ACTIVE
+            } else if hover_index == Some(i) {
+                FREQ_HOVER
+            } else {
+                FREQ_NORMAL
+            };
+            spans.push((label, mono(color)));
+        }
+        let borrowed: Vec<(&str, Attrs)> = spans.iter().map(|(s, a)| (s.as_str(), a.clone())).collect();
+        self.freq_buffer.set_rich_text(
+            &mut self.font_system,
+            borrowed,
+            &mono(FREQ_NORMAL),
+            Shaping::Basic,
+            None,
+        );
+        self.freq_buffer.shape_until_scroll(&mut self.font_system, false);
+    }
+
+    fn build_slider(buffer: &mut Buffer, font_system: &mut FontSystem, t: f32, label: &str, fill_color: Color, label_color: Color, hovered: bool) {
         let t = t.clamp(0.0, 1.0);
         let filled = (t * SLIDER_STEPS as f32).round() as usize;
+        let track_color = if hovered { Color::rgb(100, 100, 90) } else { SLIDER_TRACK };
 
-        // Build vertical slider: top = max, bottom = min
-        // Each line is one step of the track
         let mut spans: Vec<(String, Attrs)> = Vec::new();
+        // Title at top
+        spans.push((label.to_string(), mono(label_color)));
+        spans.push(("\n".to_string(), mono(track_color)));
+
         for i in (0..SLIDER_STEPS).rev() {
-            if i < SLIDER_STEPS - 1 {
-                spans.push(("\n".to_string(), mono(SLIDER_TRACK)));
-            }
             if i == filled {
-                spans.push((" \u{25C0} ".to_string(), mono(SLIDER_FILL))); // ◀ marker
+                spans.push((" \u{25C0}\n".to_string(), mono(fill_color)));
             } else if i <= filled {
-                spans.push((" \u{2503} ".to_string(), mono(SLIDER_FILL))); // ┃ filled
+                spans.push((" \u{2503}\n".to_string(), mono(fill_color)));
             } else {
-                spans.push((" \u{2502} ".to_string(), mono(SLIDER_TRACK))); // │ empty
+                spans.push((" \u{2502}\n".to_string(), mono(track_color)));
             }
         }
-        // Label at bottom
-        spans.push(("\n".to_string(), mono(SLIDER_LABEL)));
-        spans.push((label.to_string(), mono(SLIDER_LABEL)));
 
-        let borrowed_spans: Vec<(&str, Attrs)> = spans.iter().map(|(s, a)| (s.as_str(), a.clone())).collect();
-        self.slider_buffer.set_rich_text(
-            &mut self.font_system,
-            borrowed_spans,
+        let borrowed: Vec<(&str, Attrs)> = spans.iter().map(|(s, a)| (s.as_str(), a.clone())).collect();
+        buffer.set_rich_text(
+            font_system,
+            borrowed,
             &mono(SLIDER_TRACK),
             Shaping::Basic,
             None,
         );
-        self.slider_buffer.shape_until_scroll(&mut self.font_system, false);
+        buffer.shape_until_scroll(font_system, false);
     }
 
-    pub fn hide_slider(&mut self) {
-        self.show_slider = false;
+    pub fn set_stiffness_slider(&mut self, t: f32, label: &str, hovered: bool) {
+        Self::build_slider(&mut self.stiffness_slider, &mut self.font_system, t, label, SLIDER_FILL, SLIDER_LABEL, hovered);
+    }
+
+    pub fn set_pretension_slider(&mut self, t: f32, label: &str, hovered: bool) {
+        Self::build_slider(&mut self.pretension_slider, &mut self.font_system, t, label, PRETENSION_FILL, PRETENSION_LABEL, hovered);
+    }
+
+    pub fn freq_bar_left(&self) -> f32 {
+        self.screen_width - FREQ_CHOICES.len() as f32 * FREQ_BUTTON_WIDTH - FREQ_BAR_RIGHT_MARGIN
+    }
+
+    /// Which slider column (if any) is the cursor over? Returns 0 for stiffness, 1 for pretension.
+    pub fn slider_hit(&self, cursor_x: f64) -> Option<usize> {
+        let x = cursor_x as f32;
+        if x >= SLIDER_COL_1 && x < SLIDER_COL_1 + SLIDER_COL_WIDTH {
+            Some(0) // stiffness
+        } else if x >= SLIDER_COL_2 && x < SLIDER_COL_2 + SLIDER_COL_WIDTH {
+            Some(1) // pretension
+        } else {
+            None
+        }
+    }
+
+    /// Map a cursor Y position to a slider value 0.0..1.0.
+    /// Top of slider = 1.0 (max), bottom = 0.0 (min).
+    pub fn slider_y_to_t(&self, cursor_y: f64) -> f32 {
+        let slider_lines = (SLIDER_STEPS + 2) as f32; // steps + label + gap
+        let slider_height = slider_lines * 26.0;
+        let slider_top = (self.screen_height - slider_height) * 0.5;
+        // The track starts after the label line (1 line = 26px)
+        let track_top = slider_top + 26.0;
+        let track_height = SLIDER_STEPS as f32 * 26.0;
+
+        let y = cursor_y as f32;
+        // Top of track = high value (1.0), bottom = low value (0.0)
+        let t = 1.0 - (y - track_top) / track_height;
+        t.clamp(0.0, 1.0)
     }
 
     pub fn prepare(
@@ -176,6 +263,7 @@ impl Hud {
         width: u32,
         height: u32,
     ) {
+        self.screen_width = width as f32;
         self.screen_height = height as f32;
         self.viewport.update(queue, Resolution { width, height });
 
@@ -187,12 +275,13 @@ impl Hud {
         let info_height = info_lines * 24.0;
         let info_top = self.screen_height - info_height - 16.0;
 
-        // Slider centered vertically on left edge
-        let slider_lines = self.slider_buffer.lines.len() as f32;
-        let slider_height = slider_lines * 32.0;
+        let slider_lines = self.stiffness_slider.lines.len() as f32;
+        let slider_height = slider_lines * 26.0;
         let slider_top = (self.screen_height - slider_height) * 0.5;
 
-        let mut text_areas: Vec<TextArea> = vec![
+        let freq_left = self.freq_bar_left();
+
+        let text_areas: Vec<TextArea> = vec![
             TextArea {
                 buffer: &self.title_buffer,
                 left: 16.0,
@@ -220,19 +309,36 @@ impl Hud {
                 default_color: INFO_COLOR,
                 custom_glyphs: &[],
             },
-        ];
-
-        if self.show_slider {
-            text_areas.push(TextArea {
-                buffer: &self.slider_buffer,
-                left: 6.0,
+            TextArea {
+                buffer: &self.freq_buffer,
+                left: freq_left,
+                top: FREQ_BAR_TOP,
+                scale: 1.0,
+                bounds: TextBounds { left: 0, top: 0, right: width as i32, bottom: height as i32 },
+                default_color: FREQ_NORMAL,
+                custom_glyphs: &[],
+            },
+            // Stiffness slider: left column
+            TextArea {
+                buffer: &self.stiffness_slider,
+                left: SLIDER_COL_1,
                 top: slider_top,
                 scale: 1.0,
                 bounds: TextBounds { left: 0, top: 0, right: width as i32, bottom: height as i32 },
                 default_color: SLIDER_TRACK,
                 custom_glyphs: &[],
-            });
-        }
+            },
+            // Pretension slider: second column
+            TextArea {
+                buffer: &self.pretension_slider,
+                left: SLIDER_COL_2,
+                top: slider_top,
+                scale: 1.0,
+                bounds: TextBounds { left: 0, top: 0, right: width as i32, bottom: height as i32 },
+                default_color: SLIDER_TRACK,
+                custom_glyphs: &[],
+            },
+        ];
 
         self.text_renderer
             .prepare(

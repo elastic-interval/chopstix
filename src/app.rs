@@ -9,28 +9,12 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::camera::Camera;
 use crate::constants::*;
-use crate::gpu::hud::Hud;
+use crate::gpu::hud::{Hud, FREQ_CHOICES, FREQ_BUTTON_WIDTH, FREQ_BAR_HEIGHT, FREQ_BAR_TOP};
 use crate::gpu::physics::{PhysicsCompute, PhysicsConfig};
 use crate::gpu::renderer::Renderer;
 use crate::gpu::Gpu;
 use crate::tensegrity::{self, TensegritySphereBuffers};
 
-#[derive(Clone, Copy, PartialEq)]
-enum Mode {
-    Orbit,
-    Stiffness,
-    Pretension,
-}
-
-impl Mode {
-    fn name(self) -> &'static str {
-        match self {
-            Mode::Orbit => "ORBIT",
-            Mode::Stiffness => "STIFFNESS",
-            Mode::Pretension => "PRETENSION",
-        }
-    }
-}
 
 struct AppState {
     window: Arc<Window>,
@@ -53,7 +37,8 @@ struct AppState {
     pull_k_at_1m: f32,
     pretension: f32,
     show_hud: bool,
-    mode: Mode,
+    /// Which slider is being dragged (0=stiffness, 1=pretension), or None
+    dragging_slider: Option<usize>,
 }
 
 pub struct App {
@@ -145,6 +130,49 @@ impl App {
         state.physics = PhysicsCompute::new(&state.gpu.device, &state.gpu.queue, &state.buffers, &config);
         update_title(state);
     }
+
+    /// Returns which frequency button the cursor is over, if any.
+    fn freq_bar_hover_index(state: &AppState) -> Option<usize> {
+        let bar_left = state.hud.freq_bar_left() as f64;
+        let (cx, cy) = state.cursor_pos;
+        if cy < FREQ_BAR_TOP as f64 || cy > (FREQ_BAR_TOP + FREQ_BAR_HEIGHT) as f64 {
+            return None;
+        }
+        if cx < bar_left {
+            return None;
+        }
+        let idx = ((cx - bar_left) / FREQ_BUTTON_WIDTH as f64) as usize;
+        if idx < FREQ_CHOICES.len() {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the frequency at the cursor position, if clicking on the freq bar.
+    fn freq_bar_hit(state: &AppState) -> Option<usize> {
+        App::freq_bar_hover_index(state).map(|i| FREQ_CHOICES[i])
+    }
+
+    /// Apply slider position from current cursor Y.
+    fn apply_slider_drag(state: &mut AppState) {
+        let Some(col) = state.dragging_slider else { return };
+        let t = state.hud.slider_y_to_t(state.cursor_pos.1);
+        match col {
+            0 => {
+                // Stiffness: log scale 1e3..1e10
+                state.pull_k_at_1m = 10.0_f32.powf(3.0 + t * 7.0).clamp(1e3, 1e10);
+                App::update_stiffness(state);
+            }
+            1 => {
+                // Pretension: t=0 → 1.0 (0%), t=1 → 0.5 (50%)
+                let new_pretension = (1.0 - t * 0.5).clamp(0.5, 1.0);
+                let factor = new_pretension / state.pretension;
+                App::adjust_pretension(state, factor);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn update_title(state: &AppState) {
@@ -211,7 +239,7 @@ impl ApplicationHandler for App {
             pull_k_at_1m: PULL_K_AT_1M,
             pretension: 0.95,
             show_hud: true,
-            mode: Mode::Orbit,
+            dragging_slider: None,
         };
         state.renderer.update_instances(&state.gpu.device, &state.buffers.positions);
         log::info!("Initial instances populated, {} positions", state.buffers.positions.len());
@@ -247,80 +275,47 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => {
-                // Global keys (all modes)
                 match &logical_key {
-                    Key::Named(NamedKey::Escape) => {
-                        if state.mode != Mode::Orbit {
-                            state.camera.mouse_released();
-                            state.mode = Mode::Orbit;
-                        } else {
-                            event_loop.exit();
-                        }
-                        return;
-                    }
+                    Key::Named(NamedKey::Escape) => event_loop.exit(),
                     Key::Named(NamedKey::Space) => {
                         state.paused = !state.paused;
-                        return;
                     }
                     Key::Character(c) if c.as_str() == "h" => {
                         state.show_hud = !state.show_hud;
-                        return;
                     }
                     _ => {}
-                }
-
-                // Mode-switching keys
-                match &logical_key {
-                    Key::Character(c) if c.as_str() == "s" => {
-                        state.camera.mouse_released();
-                        state.mode = if state.mode == Mode::Stiffness { Mode::Orbit } else { Mode::Stiffness };
-                        return;
-                    }
-                    Key::Character(c) if c.as_str() == "p" => {
-                        state.camera.mouse_released();
-                        state.mode = if state.mode == Mode::Pretension { Mode::Orbit } else { Mode::Pretension };
-                        return;
-                    }
-                    _ => {}
-                }
-
-                // Mode-specific keys
-                match state.mode {
-                    Mode::Orbit => match &logical_key {
-                        Key::Character(c) if c.as_str() == "=" || c.as_str() == "+" => {
-                            state.frequency += 1;
-                            App::rebuild_sphere(state);
-                        }
-                        Key::Character(c) if c.as_str() == "-" => {
-                            if state.frequency > 1 {
-                                state.frequency -= 1;
-                                App::rebuild_sphere(state);
-                            }
-                        }
-                        _ => {}
-                    },
-                    Mode::Stiffness | Mode::Pretension => {}
                 }
             }
             WindowEvent::MouseInput {
                 state: button_state,
                 button: MouseButton::Left,
                 ..
-            } => {
-                if state.mode == Mode::Orbit {
-                    match button_state {
-                        ElementState::Pressed => {
-                            state.camera.mouse_pressed(state.cursor_pos.0, state.cursor_pos.1);
+            } => match button_state {
+                ElementState::Pressed => {
+                    // Check frequency bar hit
+                    if let Some(freq) = App::freq_bar_hit(state) {
+                        if freq != state.frequency {
+                            state.frequency = freq;
+                            App::rebuild_sphere(state);
                         }
-                        ElementState::Released => {
-                            state.camera.mouse_released();
-                        }
+                    } else if let Some(col) = state.hud.slider_hit(state.cursor_pos.0) {
+                        // Start dragging a slider
+                        state.dragging_slider = Some(col);
+                        App::apply_slider_drag(state);
+                    } else {
+                        state.camera.mouse_pressed(state.cursor_pos.0, state.cursor_pos.1);
                     }
                 }
-            }
+                ElementState::Released => {
+                    state.dragging_slider = None;
+                    state.camera.mouse_released();
+                }
+            },
             WindowEvent::CursorMoved { position, .. } => {
                 state.cursor_pos = (position.x, position.y);
-                if state.mode == Mode::Orbit {
+                if state.dragging_slider.is_some() {
+                    App::apply_slider_drag(state);
+                } else {
                     state.camera.mouse_moved(position.x, position.y);
                 }
             }
@@ -332,19 +327,21 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 50.0,
                 };
-                match state.mode {
-                    Mode::Orbit => {
-                        state.camera.scroll(scroll);
-                    }
-                    Mode::Stiffness => {
+                // Scroll near the slider adjusts the parameter; elsewhere zooms
+                match state.hud.slider_hit(state.cursor_pos.0) {
+                    Some(0) => {
+                        // Stiffness slider
                         let factor = 1.2_f32.powf(scroll);
                         state.pull_k_at_1m = (state.pull_k_at_1m * factor).clamp(1e3, 1e10);
                         App::update_stiffness(state);
                     }
-                    Mode::Pretension => {
-                        // Scroll up (negative on macOS natural) = tighten
+                    Some(1) => {
+                        // Pretension slider
                         let factor = 1.03_f32.powf(scroll);
                         App::adjust_pretension(state, factor);
+                    }
+                    _ => {
+                        state.camera.scroll(scroll);
                     }
                 }
             }
@@ -364,63 +361,31 @@ impl ApplicationHandler for App {
                 if state.show_hud {
                     let config = PhysicsConfig { pull_k_at_1m: state.pull_k_at_1m, ..PhysicsConfig::default() }
                         .scaled_for_frequency(state.frequency);
-
-                    // Title: mode name + primary value
                     let paused_tag = if state.paused { "  PAUSED" } else { "" };
-                    let title_value = match state.mode {
-                        Mode::Orbit => format!(
-                            "freq {}  {:.0} FPS{}", state.frequency, state.last_fps, paused_tag,
-                        ),
-                        Mode::Stiffness => format!(
-                            "K = {:.2e} N/m{}", state.pull_k_at_1m, paused_tag,
-                        ),
-                        Mode::Pretension => format!(
-                            "{:.1}%{}", (1.0 - state.pretension) * 100.0, paused_tag,
-                        ),
-                    };
-                    state.hud.set_title(state.mode.name(), &title_value);
 
-                    // Legend: mode-specific keys
-                    match state.mode {
-                        Mode::Orbit => {
-                            state.hud.set_legend(&[
-                                ("+/-", &format!("frequency  {}", state.frequency)),
-                                ("scroll", "zoom"),
-                                ("drag", "orbit"),
-                                ("S", "stiffness mode"),
-                                ("P", "pretension mode"),
-                                ("Space", if state.paused { "resume" } else { "pause" }),
-                                ("H", "hide HUD"),
-                            ]);
-                        }
-                        Mode::Stiffness => {
-                            state.hud.set_legend(&[
-                                ("scroll", "adjust stiffness"),
-                                ("S", "back to orbit"),
-                                ("Esc", "back to orbit"),
-                                ("Space", if state.paused { "resume" } else { "pause" }),
-                            ]);
-                            // Log-scale slider: K range 1e3..1e10
-                            let t = (state.pull_k_at_1m.log10() - 3.0) / 7.0;
-                            state.hud.set_slider(t, &format!("{:.1e}", state.pull_k_at_1m));
-                        }
-                        Mode::Pretension => {
-                            state.hud.set_legend(&[
-                                ("scroll", "adjust pretension"),
-                                ("P", "back to orbit"),
-                                ("Esc", "back to orbit"),
-                                ("Space", if state.paused { "resume" } else { "pause" }),
-                            ]);
-                            // Linear slider: pretension 0.5..1.0 (50%..0%)
-                            let t = (1.0 - state.pretension) / 0.5; // 0% → 0.0, 50% → 1.0
-                            state.hud.set_slider(t, &format!("{:.1}%", (1.0 - state.pretension) * 100.0));
-                        }
-                    }
+                    // Title
+                    state.hud.set_title("CHOPSTIX", &format!(
+                        "{:.0} FPS{}", state.last_fps, paused_tag,
+                    ));
 
-                    // Slider: hide in orbit mode
-                    if state.mode == Mode::Orbit {
-                        state.hud.hide_slider();
-                    }
+                    // Frequency bar
+                    let hover_idx = App::freq_bar_hover_index(state);
+                    state.hud.set_freq_bar(state.frequency, hover_idx);
+
+                    // Legend
+                    state.hud.set_legend(&[
+                        ("Space", if state.paused { "resume" } else { "pause" }),
+                        ("H", "hide HUD"),
+                    ]);
+
+                    // Both sliders always visible, highlight on hover
+                    let hover_col = state.hud.slider_hit(state.cursor_pos.0);
+                    let k_t = (state.pull_k_at_1m.log10() - 3.0) / 7.0;
+                    state.hud.set_stiffness_slider(k_t, &format!("K {:.0e}", state.pull_k_at_1m),
+                        hover_col == Some(0) || state.dragging_slider == Some(0));
+                    let p_t = (1.0 - state.pretension) / 0.5;
+                    state.hud.set_pretension_slider(p_t, &format!("P {:.0}%", (1.0 - state.pretension) * 100.0),
+                        hover_col == Some(1) || state.dragging_slider == Some(1));
 
                     // Info: stats (bottom-right)
                     state.hud.set_info(&format!(
