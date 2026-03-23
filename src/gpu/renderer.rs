@@ -352,6 +352,27 @@ impl Renderer {
         self.push_omega = buffers.push_omega.clone();
         self.radius_scale = 3.0 / frequency as f32;
     }
+
+    /// Replace the entire topology with growable physics state.
+    /// Used for DSL builds where topology changes incrementally.
+    pub fn set_growable_topology(
+        &mut self,
+        elastic_alpha: Vec<u32>,
+        elastic_omega: Vec<u32>,
+        push_alpha: Vec<u32>,
+        push_omega: Vec<u32>,
+    ) {
+        self.elastic_alpha = elastic_alpha;
+        self.elastic_omega = elastic_omega;
+        self.rigid_alpha = Vec::new();
+        self.rigid_omega = Vec::new();
+        self.push_alpha = push_alpha;
+        self.push_omega = push_omega;
+    }
+
+    pub fn set_radius_scale(&mut self, scale: f32) {
+        self.radius_scale = scale;
+    }
 }
 
 fn create_cylinder(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::Buffer, u32) {

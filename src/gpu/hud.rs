@@ -57,6 +57,17 @@ pub const SURFACE_BAR_TOP: f32 = 122.0; // below Möbius bar
 pub const SURFACE_BUTTON_WIDTH: f32 = 108.0; // 10 chars × 10.8px (18px monospace)
 pub const SURFACE_BAR_HEIGHT: f32 = 30.0;
 
+/// Build preset buttons
+pub const BUILD_CHOICES: &[(&str, usize)] = &[
+    ("Col 3", 3),
+    ("Col 6", 6),
+    ("Col 10", 10),
+    ("Col 20", 20),
+];
+pub const BUILD_BUTTON_WIDTH: f32 = 75.0;
+pub const BUILD_ROW_HEIGHT: f32 = 30.0;
+pub const BUILD_BAR_TOP: f32 = 156.0; // below Surface bar
+
 /// X offset for each slider column
 const SLIDER_COL_1: f32 = 10.0;
 const SLIDER_COL_2: f32 = 70.0;
@@ -79,6 +90,7 @@ pub struct Hud {
     klein_buffer: Buffer,
     mobius_buffer: Buffer,
     surface_buffer: Buffer,
+    build_buffer: Buffer,
     screen_width: f32,
     screen_height: f32,
 }
@@ -137,6 +149,10 @@ impl Hud {
         let mut surface_buffer = Buffer::new(&mut font_system, Metrics::new(18.0, SURFACE_BAR_HEIGHT));
         surface_buffer.set_size(&mut font_system, Some(surface_width), Some(SURFACE_BAR_HEIGHT + 4.0));
 
+        let build_width = BUILD_CHOICES.len() as f32 * BUILD_BUTTON_WIDTH + 20.0;
+        let mut build_buffer = Buffer::new(&mut font_system, Metrics::new(18.0, BUILD_ROW_HEIGHT));
+        build_buffer.set_size(&mut font_system, Some(build_width), Some(BUILD_ROW_HEIGHT + 4.0));
+
         Self {
             font_system,
             swash_cache,
@@ -153,6 +169,7 @@ impl Hud {
             klein_buffer,
             mobius_buffer,
             surface_buffer,
+            build_buffer,
             screen_width: 1280.0,
             screen_height: 600.0,
         }
@@ -371,6 +388,34 @@ impl Hud {
         self.screen_width - 5.0 * SURFACE_BUTTON_WIDTH - FREQ_BAR_RIGHT_MARGIN
     }
 
+    pub fn build_bar_left(&self) -> f32 {
+        self.screen_width - BUILD_CHOICES.len() as f32 * BUILD_BUTTON_WIDTH - FREQ_BAR_RIGHT_MARGIN
+    }
+
+    pub fn set_build_bar(&mut self, active_count: Option<usize>, hover_index: Option<usize>) {
+        let mut spans: Vec<(String, Attrs)> = Vec::new();
+        for (i, &(name, count)) in BUILD_CHOICES.iter().enumerate() {
+            let label = format!(" {:^5} ", name);
+            let color = if active_count == Some(count) {
+                FREQ_ACTIVE
+            } else if hover_index == Some(i) {
+                FREQ_HOVER
+            } else {
+                FREQ_NORMAL
+            };
+            spans.push((label, mono(color)));
+        }
+        let borrowed: Vec<(&str, Attrs)> = spans.iter().map(|(s, a)| (s.as_str(), a.clone())).collect();
+        self.build_buffer.set_rich_text(
+            &mut self.font_system,
+            borrowed,
+            &mono(FREQ_NORMAL),
+            Shaping::Basic,
+            None,
+        );
+        self.build_buffer.shape_until_scroll(&mut self.font_system, false);
+    }
+
     pub fn freq_bar_left(&self) -> f32 {
         self.screen_width - FREQ_CHOICES.len() as f32 * FREQ_BUTTON_WIDTH - FREQ_BAR_RIGHT_MARGIN
     }
@@ -525,6 +570,17 @@ impl Hud {
             buffer: &self.surface_buffer,
             left: self.surface_bar_left(),
             top: SURFACE_BAR_TOP,
+            scale: 1.0,
+            bounds,
+            default_color: FREQ_NORMAL,
+            custom_glyphs: &[],
+        });
+
+        // Build preset bar
+        text_areas.push(TextArea {
+            buffer: &self.build_buffer,
+            left: self.build_bar_left(),
+            top: BUILD_BAR_TOP,
             scale: 1.0,
             bounds,
             default_color: FREQ_NORMAL,

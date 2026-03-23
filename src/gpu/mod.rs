@@ -1,3 +1,4 @@
+pub mod growable;
 pub mod hud;
 pub mod physics;
 pub mod renderer;

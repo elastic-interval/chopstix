@@ -7,12 +7,16 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
+use crate::build::executor::{BuildExecutor, BuildNode};
+use crate::build::Spin;
 use crate::camera::Camera;
 use crate::constants::*;
+use crate::gpu::growable::GrowablePhysics;
 use crate::gpu::hud::{Hud, FREQ_CHOICES, FREQ_BUTTON_WIDTH, FREQ_BAR_HEIGHT, FREQ_BAR_TOP,
     KLEIN_CHOICES, KLEIN_COLS, KLEIN_BUTTON_WIDTH, KLEIN_ROW_HEIGHT, KLEIN_GRID_TOP,
     MOBIUS_CHOICES, MOBIUS_BUTTON_WIDTH, MOBIUS_ROW_HEIGHT, MOBIUS_BAR_TOP,
-    SURFACE_BUTTON_WIDTH, SURFACE_BAR_TOP, SURFACE_BAR_HEIGHT};
+    SURFACE_BUTTON_WIDTH, SURFACE_BAR_TOP, SURFACE_BAR_HEIGHT,
+    BUILD_CHOICES, BUILD_BUTTON_WIDTH, BUILD_ROW_HEIGHT, BUILD_BAR_TOP};
 use crate::gpu::physics::{PhysicsCompute, PhysicsConfig, SURFACE_NAMES};
 use crate::gpu::renderer::Renderer;
 use crate::gpu::Gpu;
@@ -52,6 +56,9 @@ struct AppState {
     pending_rebuild: u32,
     /// Muscle twitching animation (active for Möbius)
     twitcher: Option<Twitcher>,
+    /// Incremental build system (active for Tenscript shapes)
+    builder: Option<BuildExecutor>,
+    growable_physics: Option<GrowablePhysics>,
 }
 
 pub struct App {
@@ -78,6 +85,28 @@ impl App {
             ShapeConfig::Mobius { segments } => {
                 mobius::generate_mobius(*segments, pull_k_at_1m)
             }
+            ShapeConfig::Tenscript { .. } => {
+                // Tenscript shapes use GrowablePhysics, not pre-generated buffers.
+                // Return empty buffers; the builder handles everything.
+                TensegritySphereBuffers {
+                    positions: Vec::new(),
+                    velocities: Vec::new(),
+                    elastic_alpha: Vec::new(),
+                    elastic_omega: Vec::new(),
+                    elastic_ideal: Vec::new(),
+                    elastic_k: Vec::new(),
+                    rigid_alpha: Vec::new(),
+                    rigid_omega: Vec::new(),
+                    rigid_length: Vec::new(),
+                    rigid_half_mass: Vec::new(),
+                    push_alpha: Vec::new(),
+                    push_omega: Vec::new(),
+                    push_ideal: Vec::new(),
+                    push_k: Vec::new(),
+                    push_half_mass: Vec::new(),
+                    use_spring_push: true,
+                }
+            }
         }
     }
 
@@ -94,6 +123,7 @@ impl App {
                 let joints = (segments * 2 + 1) * 3;
                 ((joints as f32 / 10.0).sqrt() as usize).max(1)
             }
+            ShapeConfig::Tenscript { .. } => 3, // reasonable default for rendering scale
         }
     }
 
@@ -104,7 +134,7 @@ impl App {
             surface_character,
             ..PhysicsConfig::default()
         };
-        if matches!(shape, ShapeConfig::Klein { .. } | ShapeConfig::Mobius { .. }) {
+        if matches!(shape, ShapeConfig::Klein { .. } | ShapeConfig::Mobius { .. } | ShapeConfig::Tenscript { .. }) {
             config.gravity = 0.0;
             config.ground_y = -1e6;
         }
@@ -114,6 +144,10 @@ impl App {
     /// Whether the current shape uses approach-based settling
     fn uses_approach(shape: &ShapeConfig) -> bool {
         matches!(shape, ShapeConfig::Klein { .. } | ShapeConfig::Mobius { .. })
+    }
+
+    fn is_tenscript(shape: &ShapeConfig) -> bool {
+        matches!(shape, ShapeConfig::Tenscript { .. })
     }
 
     /// Create a twitcher appropriate for the shape, or None.
@@ -130,7 +164,7 @@ impl App {
     /// Whether the ground grid should be visible
     fn show_ground(shape: &ShapeConfig, surface_character: u32) -> bool {
         // No ground for zero-gravity shapes or absent surface
-        if matches!(shape, ShapeConfig::Klein { .. } | ShapeConfig::Mobius { .. }) {
+        if matches!(shape, ShapeConfig::Klein { .. } | ShapeConfig::Mobius { .. } | ShapeConfig::Tenscript { .. }) {
             return false;
         }
         surface_character != 0 // 0 = Absent
@@ -145,6 +179,15 @@ impl App {
     }
 
     fn rebuild_shape(state: &mut AppState) {
+        // Clear any previous builder
+        state.builder = None;
+        state.growable_physics = None;
+
+        if App::is_tenscript(&state.shape) {
+            App::rebuild_tenscript(state);
+            return;
+        }
+
         let config = App::physics_config(&state.shape, state.pull_k_at_1m, state.frequency, state.surface_character);
         let mut buffers = App::generate_shape(&state.shape, state.pull_k_at_1m);
 
@@ -176,8 +219,76 @@ impl App {
         update_title(state);
     }
 
+    fn rebuild_tenscript(state: &mut AppState) {
+        let program = match &state.shape {
+            ShapeConfig::Tenscript { program } => program.clone(),
+            _ => return,
+        };
+
+        let config = App::physics_config(&state.shape, state.pull_k_at_1m, state.frequency, state.surface_character);
+        state.iterations = config.iterations_per_frame;
+
+        let mut growable = GrowablePhysics::new(&state.gpu.device, &config);
+        let builder = BuildExecutor::new(
+            &mut growable,
+            &state.gpu.queue,
+            program,
+            state.pull_k_at_1m,
+            2.0,  // face_radius
+            7.0,  // brick_height
+        );
+
+        // Set up renderer with empty topology (will be populated as bricks are placed)
+        let empty_buffers = App::generate_shape(&state.shape, state.pull_k_at_1m);
+        state.renderer.update_topology(&empty_buffers, state.frequency);
+        state.renderer.set_radius_scale(1.0);
+
+        // Initial camera distance
+        state.camera.set_distance(30.0);
+
+        state.buffers = empty_buffers;
+        state.twitcher = None;
+        // Sync initial topology to renderer
+        state.renderer.set_growable_topology(
+            growable.cpu_elastic_alpha.clone(),
+            growable.cpu_elastic_omega.clone(),
+            growable.cpu_push_alpha.clone(),
+            growable.cpu_push_omega.clone(),
+        );
+
+        // Update instances with initial positions
+        let initial_positions = builder.positions.clone();
+        state.renderer.update_instances(&state.gpu.device, &initial_positions, false);
+
+        state.growable_physics = Some(growable);
+        state.builder = Some(builder);
+
+        log::info!("Tenscript build started: dt={:.6}s, iterations={}", config.dt, state.iterations);
+        update_title(state);
+    }
+
+    /// Returns the build button index the cursor is over, if any.
+    fn build_hover_index(state: &AppState) -> Option<usize> {
+        let bar_left = state.hud.build_bar_left() as f64;
+        let (cx, cy) = state.cursor_pos;
+        if cy < BUILD_BAR_TOP as f64 || cy > (BUILD_BAR_TOP + BUILD_ROW_HEIGHT) as f64 {
+            return None;
+        }
+        if cx < bar_left { return None; }
+        let idx = ((cx - bar_left) / BUILD_BUTTON_WIDTH as f64) as usize;
+        if idx < BUILD_CHOICES.len() { Some(idx) } else { None }
+    }
+
+    fn build_hit(state: &AppState) -> Option<usize> {
+        App::build_hover_index(state).map(|i| BUILD_CHOICES[i].1)
+    }
+
     /// Update cable stiffness without resettling — keeps current positions/velocities.
+    /// Not applicable to Tenscript builds.
     fn update_stiffness(state: &mut AppState) {
+        if App::is_tenscript(&state.shape) {
+            return;
+        }
         let config = App::physics_config(&state.shape, state.pull_k_at_1m, state.frequency, state.surface_character);
 
         // Read back current positions from GPU
@@ -204,7 +315,11 @@ impl App {
 
     /// Adjust pretension by scaling all cable ideal lengths — approach span strategy.
     /// factor < 1.0 tightens (shorter rest length), > 1.0 loosens.
+    /// Not applicable to Tenscript builds.
     fn adjust_pretension(state: &mut AppState, factor: f32) {
+        if App::is_tenscript(&state.shape) {
+            return;
+        }
         state.pretension = (state.pretension * factor).clamp(0.5, 1.0);
 
         let config = App::physics_config(&state.shape, state.pull_k_at_1m, state.frequency, state.surface_character);
@@ -345,6 +460,13 @@ fn update_title(state: &AppState) {
         ShapeConfig::Sphere { frequency } => format!("sphere freq={}", frequency),
         ShapeConfig::Klein { width, height, .. } => format!("klein {}x{}", width, height),
         ShapeConfig::Mobius { segments } => format!("mobius seg={}", segments),
+        ShapeConfig::Tenscript { .. } => {
+            if let Some(ref builder) = state.builder {
+                format!("tenscript [{}]", builder.stage_name())
+            } else {
+                "tenscript".to_string()
+            }
+        }
     };
     let surface_tag = SURFACE_NAMES[state.surface_character as usize];
     let num_struts = state.buffers.num_rigid() + state.buffers.num_push();
@@ -382,11 +504,18 @@ impl ApplicationHandler for App {
             ShapeConfig::Sphere { .. } => 1, // Bouncy
             _ => 0, // Absent
         };
-        let config = App::physics_config(&self.shape, PULL_K_AT_1M, frequency, initial_surface);
-        let mut buffers = App::generate_shape(&self.shape, PULL_K_AT_1M);
+
+        // For Tenscript, use a dummy sphere for initial PhysicsCompute (will be replaced by rebuild)
+        let init_shape = if App::is_tenscript(&self.shape) {
+            ShapeConfig::Sphere { frequency: 1 }
+        } else {
+            self.shape.clone()
+        };
+        let config = App::physics_config(&init_shape, PULL_K_AT_1M, frequency, initial_surface);
+        let mut buffers = App::generate_shape(&init_shape, PULL_K_AT_1M);
 
         // Settle
-        if App::uses_approach(&self.shape) {
+        if App::uses_approach(&init_shape) {
             buffers.positions = PhysicsCompute::settle_with_approach(
                 &gpu.device, &gpu.queue, &mut buffers, &config,
             );
@@ -434,6 +563,8 @@ impl ApplicationHandler for App {
             dragging_slider: None,
             pending_rebuild: 0,
             twitcher: None,
+            builder: None,
+            growable_physics: None,
         };
         state.renderer.update_instances(&state.gpu.device, &state.buffers.positions, App::show_ground(&state.shape, state.surface_character));
         log::info!("Initial instances populated, {} positions", state.buffers.positions.len());
@@ -441,6 +572,12 @@ impl ApplicationHandler for App {
             log::info!("First joint position: [{:.2}, {:.2}, {:.2}]", pos[0], pos[1], pos[2]);
         }
         update_title(&state);
+
+        // If starting with a Tenscript shape, schedule immediate rebuild
+        if App::is_tenscript(&state.shape) {
+            App::schedule_rebuild(&mut state);
+        }
+
         self.state = Some(state);
     }
 
@@ -528,6 +665,15 @@ impl ApplicationHandler for App {
                             App::update_stiffness(state); // rebuilds physics with new surface
                             return;
                         }
+                    }
+                    // Build preset bar
+                    if let Some(count) = App::build_hit(state) {
+                        state.shape = ShapeConfig::Tenscript {
+                            program: BuildNode::Column { count, spin: Spin::Left },
+                        };
+                        state.frequency = App::frequency_for_shape(&state.shape);
+                        App::schedule_rebuild(state);
+                        return;
                     }
                     if let Some(col) = state.hud.slider_hit(state.cursor_pos.0) {
                         state.dragging_slider = Some(col);
@@ -619,6 +765,13 @@ impl ApplicationHandler for App {
                         ShapeConfig::Sphere { frequency } => format!("Geodesic Sphere  freq {}", frequency),
                         ShapeConfig::Klein { width, height, .. } => format!("Klein Bottle  {}x{}", width, height),
                         ShapeConfig::Mobius { segments } => format!("Mobius Band  {} segments", segments),
+                        ShapeConfig::Tenscript { .. } => {
+                            if let Some(ref builder) = state.builder {
+                                format!("Tenscript Build  [{}]", builder.stage_name())
+                            } else {
+                                "Tenscript Build".to_string()
+                            }
+                        }
                     };
                     state.hud.set_shape_title(&shape_title);
 
@@ -641,6 +794,14 @@ impl ApplicationHandler for App {
                     let surface_hover = App::surface_hover_index(state);
                     state.hud.set_surface_bar(state.surface_character, surface_hover);
 
+                    // Build preset bar
+                    let build_hover = App::build_hover_index(state);
+                    let active_build = match &state.shape {
+                        ShapeConfig::Tenscript { program: BuildNode::Column { count, .. } } => Some(*count),
+                        _ => None,
+                    };
+                    state.hud.set_build_bar(active_build, build_hover);
+
                     // Legend
                     state.hud.set_legend(&[
                         ("Space", if state.paused { "resume" } else { "pause" }),
@@ -657,14 +818,22 @@ impl ApplicationHandler for App {
                         hover_col == Some(1) || state.dragging_slider == Some(1));
 
                     // Info: stats (bottom-right)
-                    let num_struts = state.buffers.num_rigid() + state.buffers.num_push();
-                    let mode_tag = if state.buffers.use_spring_push { "spring" } else { "SHAKE" };
-                    state.hud.set_info(&format!(
-                        "{} joints  {} struts  {} cables  [{}]\ndt {:.0}us  {} iter/frame",
-                        state.buffers.num_joints(), num_struts, state.buffers.num_elastic(),
-                        mode_tag,
-                        config.dt * 1e6, config.iterations_per_frame,
-                    ));
+                    if let Some(ref growable) = state.growable_physics {
+                        state.hud.set_info(&format!(
+                            "{} joints  {} struts  {} cables  [spring]\ndt {:.0}us  {} iter/frame",
+                            growable.active_joints, growable.active_push, growable.active_elastic,
+                            config.dt * 1e6, config.iterations_per_frame,
+                        ));
+                    } else {
+                        let num_struts = state.buffers.num_rigid() + state.buffers.num_push();
+                        let mode_tag = if state.buffers.use_spring_push { "spring" } else { "SHAKE" };
+                        state.hud.set_info(&format!(
+                            "{} joints  {} struts  {} cables  [{}]\ndt {:.0}us  {} iter/frame",
+                            state.buffers.num_joints(), num_struts, state.buffers.num_elastic(),
+                            mode_tag,
+                            config.dt * 1e6, config.iterations_per_frame,
+                        ));
+                    }
 
                     let size = state.window.inner_size();
                     state.hud.prepare(&state.gpu.device, &state.gpu.queue, size.width, size.height);
@@ -672,50 +841,120 @@ impl ApplicationHandler for App {
 
                 // Physics
                 if !state.paused {
-                    // Update muscle twitching before physics dispatch
-                    if let Some(ref mut twitcher) = state.twitcher {
-                        if twitcher.tick() {
-                            let (ideals, ks) = twitcher.current_ideals(state.pull_k_at_1m);
-                            state.physics.write_elastic_ideals(&state.gpu.queue, &ideals, &ks);
-                        }
-                    }
+                    if state.builder.is_some() {
+                        // Growable physics path (Tenscript builds)
+                        let growable = state.growable_physics.as_mut().unwrap();
+                        let builder = state.builder.as_mut().unwrap();
 
-                    let mut encoder = state.gpu.device.create_command_encoder(
-                        &wgpu::CommandEncoderDescriptor {
-                            label: Some("Physics Encoder"),
-                        },
-                    );
-                    state.physics.dispatch(&mut encoder, state.iterations);
+                        // Tick the builder (places bricks, advances approaches)
+                        let topology_changed = builder.tick(growable, &state.gpu.queue);
 
-                    // Only do the blocking readback every N frames
-                    let do_readback = state.physics_frame % READBACK_INTERVAL == 0;
-                    if do_readback {
-                        state.physics.copy_positions_to_staging(&mut encoder);
-                    }
-                    state.gpu.queue.submit(std::iter::once(encoder.finish()));
-
-                    if do_readback {
-                        let positions = state.physics.read_positions(&state.gpu.device);
-                        state.renderer.update_instances(&state.gpu.device, &positions, App::show_ground(&state.shape, state.surface_character));
-
-                        // Check if physics violated the speed limit
-                        if state.physics.read_frozen(&state.gpu.device) {
-                            state.paused = true;
-                            log::warn!("Speed limit exceeded — simulation frozen");
+                        if topology_changed {
+                            // Update renderer topology from growable physics CPU-side arrays
+                            state.renderer.set_growable_topology(
+                                growable.cpu_elastic_alpha.clone(),
+                                growable.cpu_elastic_omega.clone(),
+                                growable.cpu_push_alpha.clone(),
+                                growable.cpu_push_omega.clone(),
+                            );
                         }
 
-                        // Track centroid with gentle drift
-                        if !positions.is_empty() {
-                            let n = positions.len() as f32;
-                            let mut cx = 0.0f32;
-                            let mut cy = 0.0f32;
-                            let mut cz = 0.0f32;
-                            for p in &positions {
-                                cx += p[0];
-                                cy += p[1];
-                                cz += p[2];
+                        // Dispatch growable physics
+                        let mut encoder = state.gpu.device.create_command_encoder(
+                            &wgpu::CommandEncoderDescriptor {
+                                label: Some("G Physics Encoder"),
+                            },
+                        );
+                        growable.dispatch(&mut encoder, state.iterations);
+
+                        let do_readback = state.physics_frame % READBACK_INTERVAL == 0;
+                        if do_readback {
+                            growable.copy_positions_to_staging(&mut encoder);
+                        }
+                        state.gpu.queue.submit(std::iter::once(encoder.finish()));
+
+                        if do_readback && growable.active_joints > 0 {
+                            let positions = growable.read_positions(&state.gpu.device);
+
+                            // Update renderer with current topology from growable physics
+                            // Build topology arrays from the growable state
+                            // For now, the renderer uses stored topology from builder
+                            state.renderer.update_instances(
+                                &state.gpu.device,
+                                &positions,
+                                false,
+                            );
+
+                            // Update builder's position cache
+                            builder.update_positions(positions.clone());
+
+                            // Track centroid
+                            if !positions.is_empty() {
+                                let n = positions.len() as f32;
+                                let mut cx = 0.0f32;
+                                let mut cy = 0.0f32;
+                                let mut cz = 0.0f32;
+                                for p in &positions {
+                                    cx += p[0];
+                                    cy += p[1];
+                                    cz += p[2];
+                                }
+                                state.camera.track_target(glam::Vec3::new(cx / n, cy / n, cz / n));
                             }
-                            state.camera.track_target(glam::Vec3::new(cx / n, cy / n, cz / n));
+
+                            // Check frozen
+                            if growable.read_frozen(&state.gpu.device) {
+                                state.paused = true;
+                                log::warn!("Speed limit exceeded — simulation frozen");
+                            }
+                        }
+                    } else {
+                        // Standard physics path (Sphere/Klein/Möbius)
+                        // Update muscle twitching before physics dispatch
+                        if let Some(ref mut twitcher) = state.twitcher {
+                            if twitcher.tick() {
+                                let (ideals, ks) = twitcher.current_ideals(state.pull_k_at_1m);
+                                state.physics.write_elastic_ideals(&state.gpu.queue, &ideals, &ks);
+                            }
+                        }
+
+                        let mut encoder = state.gpu.device.create_command_encoder(
+                            &wgpu::CommandEncoderDescriptor {
+                                label: Some("Physics Encoder"),
+                            },
+                        );
+                        state.physics.dispatch(&mut encoder, state.iterations);
+
+                        // Only do the blocking readback every N frames
+                        let do_readback = state.physics_frame % READBACK_INTERVAL == 0;
+                        if do_readback {
+                            state.physics.copy_positions_to_staging(&mut encoder);
+                        }
+                        state.gpu.queue.submit(std::iter::once(encoder.finish()));
+
+                        if do_readback {
+                            let positions = state.physics.read_positions(&state.gpu.device);
+                            state.renderer.update_instances(&state.gpu.device, &positions, App::show_ground(&state.shape, state.surface_character));
+
+                            // Check if physics violated the speed limit
+                            if state.physics.read_frozen(&state.gpu.device) {
+                                state.paused = true;
+                                log::warn!("Speed limit exceeded — simulation frozen");
+                            }
+
+                            // Track centroid with gentle drift
+                            if !positions.is_empty() {
+                                let n = positions.len() as f32;
+                                let mut cx = 0.0f32;
+                                let mut cy = 0.0f32;
+                                let mut cz = 0.0f32;
+                                for p in &positions {
+                                    cx += p[0];
+                                    cy += p[1];
+                                    cz += p[2];
+                                }
+                                state.camera.track_target(glam::Vec3::new(cx / n, cy / n, cz / n));
+                            }
                         }
                     }
                     state.physics_frame += 1;

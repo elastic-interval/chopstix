@@ -1,3 +1,4 @@
+pub mod build;
 pub mod camera;
 pub mod constants;
 pub mod gpu;

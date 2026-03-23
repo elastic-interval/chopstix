@@ -1,4 +1,5 @@
 mod app;
+mod build;
 mod camera;
 mod constants;
 mod gpu;
@@ -10,11 +11,14 @@ mod twitcher;
 
 use winit::event_loop::EventLoop;
 
+use build::executor::BuildNode;
+
 #[derive(Clone, Debug)]
 pub enum ShapeConfig {
     Sphere { frequency: usize },
     Klein { width: usize, height: usize, shift: usize },
     Mobius { segments: usize },
+    Tenscript { program: BuildNode },
 }
 
 fn main() {
