@@ -10,27 +10,55 @@ The physics simulation runs entirely on the GPU as a sequence of compute shader 
 
 All physics state lives in GPU storage buffers, organized as struct-of-arrays for coalesced memory access:
 
-- **Positions** and **velocities**: float arrays, one vec4 per joint. The w component of velocity serves as a "nuked" flag (explained below). The w component of position mirrors this flag for CPU-side detection without a full velocity readback.
+- **Positions** and **velocities**: float arrays, one vec4 per joint.
 - **Forces**: three separate arrays of atomic integers (one per axis), enabling parallel accumulation from multiple intervals writing to the same joint.
 - **Masses**: an atomic integer array, also accumulated in parallel from intervals contributing mass to their endpoint joints.
-- **Interval topology**: read-only arrays of endpoint indices, ideal lengths, spring constants, and strut masses. Uploaded once when the sphere is generated.
+- **Frozen flag**: a single atomic u32. When any joint exceeds the speed limit, this flag is set to 1 and the entire simulation halts — all shader entry points check this flag first and early-return if set.
+- **Interval topology**: read-only arrays of endpoint indices, ideal lengths, spring constants, and strut masses. Uploaded once when the shape is generated.
 
 Forces and masses use **fixed-point integer atomics** because WGSL does not support atomic floating-point operations. Float forces are multiplied by a scale factor before atomic addition, then divided back after reading. This introduces quantization error proportional to 1/scale_factor and limits the maximum representable force to i32::MAX / scale_factor.
 
+## Two Physics Modes
+
+### SHAKE/RATTLE Mode (Geodesic Spheres)
+
+Used when no two push struts share a joint. Push intervals are treated as rigid geometric constraints. 8 dispatches per iteration:
+
+1. **half_kick_and_drift** — v += 0.5·F/m·dt, x += v·dt
+2. **shake_constraints** — correct positions to maintain rigid strut lengths
+3. **elastic_forces** — Hooke's law cables with slack detection
+4. **rigid_mass** — distribute strut mass to endpoint joints
+5. **second_half_kick** — add gravity, second half velocity update, drag, force reset
+6. **rattle_constraints** — project out velocity along strut axes
+7. **ground_collision** — surface interaction with four character modes
+8. **shake_constraints** — fix constraint violations from ground repositioning
+
+### Spring-Push Mode (Klein Bottles, Möbius Bands)
+
+Used when push struts share joints (detected automatically). Push intervals are treated as stiff springs with atomic force accumulation, identical to cables but without slack detection. 5 dispatches per iteration:
+
+1. **half_kick_and_drift**
+2. **elastic_forces** (cables)
+3. **push_forces** (struts as springs — no slack check)
+4. **second_half_kick** (includes force reset)
+5. **ground_collision**
+
+No SHAKE/RATTLE needed — force accumulation via atomics handles shared joints naturally.
+
 ## The Integration Scheme
 
-The simulation uses **velocity Verlet** integration with SHAKE/RATTLE geometric constraints for rigid struts. Each iteration consists of 8 dispatches executed in sequence:
+The simulation uses **velocity Verlet** integration.
 
-### 1. Half Kick and Drift (one thread per joint)
+### Half Kick and Drift (one thread per joint)
 
 Read the accumulated forces and mass from the previous iteration. Apply the first half of the velocity update, then advance positions:
 
     v += 0.5 * (F / m) * dt
     x += v * dt
 
-If any joint exceeds the speed limit, its velocity is zeroed and it is marked as "nuked" — permanently frozen for the rest of the simulation. This prevents a single unstable joint from cascading into a full structural explosion.
+If any joint exceeds the speed limit, the global frozen flag is set. All subsequent dispatches (including future iterations in the same compute pass) detect this and skip their work. The CPU reads the frozen flag on the next readback and auto-pauses the simulation.
 
-### 2. SHAKE Position Correction (one thread per rigid strut)
+### SHAKE Position Correction (one thread per rigid strut)
 
 After positions have drifted, rigid struts may have changed length. SHAKE projects each strut back to its ideal length by moving both endpoints along the strut axis:
 
@@ -38,23 +66,23 @@ After positions have drifted, rigid struts may have changed length. SHAKE projec
     correction = error * 0.5 / actual_length
     move each endpoint by correction along the strut axis
 
-In tensegrity, no two push struts share a joint, so all constraints are independent and a single correction pass is exact. This is a crucial structural property — general rigid body constraints would require iterative convergence.
+In tensegrity, no two push struts share a joint, so all constraints are independent and a single correction pass is exact.
 
-### 3. Elastic Force Accumulation (one thread per cable)
+### Elastic Force Accumulation (one thread per cable)
 
-Each cable computes its strain relative to its ideal (rest) length. Cables are one-sided: they exert force only in tension, not compression (they go slack). The force magnitude follows Hooke's law:
+Each cable computes its strain relative to its ideal (rest) length. Cables are one-sided: they exert force only in tension, not compression (they go slack):
 
     strain = (actual - ideal) / ideal
     if strain <= 0: return  (cable is slack)
     force = k * strain * ideal
 
-Force is projected along the cable direction and accumulated into both endpoint joints' force buffers using atomic integer addition. Cable mass (proportional to current length) is also distributed to endpoints.
+Force is projected along the cable direction and accumulated into both endpoint joints' force buffers using atomic integer addition.
 
-### 4. Rigid Mass Accumulation (one thread per rigid strut)
+### Push Force Accumulation (one thread per push interval, spring-push mode only)
 
-Each strut distributes half its mass to each endpoint joint, also via atomic addition. Strut mass is pre-computed from strut length and linear density.
+Identical to elastic forces but without the slack check — push intervals resist both compression and extension. Mass is also accumulated to endpoints.
 
-### 5. Second Half Kick with Force Reset (one thread per joint)
+### Second Half Kick with Force Reset (one thread per joint)
 
 Adds gravity to the accumulated force, applies the second half of the velocity update, then applies velocity drag:
 
@@ -62,93 +90,75 @@ Adds gravity to the accumulated force, applies the second half of the velocity u
     v += 0.5 * (F / m) * dt
     v *= (1 - drag * dt)
 
-After reading forces and masses, this dispatch **resets them to zero** (forces) and **ambient mass** (masses) in preparation for the next iteration. This merged reset eliminates what was previously a separate dispatch.
+After reading forces and masses, this dispatch resets them to zero (forces) and ambient mass (masses) in preparation for the next iteration. The reset always runs even if the simulation is frozen, to keep accumulators clean.
 
-### 6. RATTLE Velocity Correction (one thread per rigid strut)
+### Ground Collision with Surface Character (one thread per joint)
 
-The velocity update may have introduced relative velocity along rigid strut axes. RATTLE projects this out:
+Five surface interaction modes, selectable at runtime:
 
-    relative_velocity_along_strut = (v_omega - v_alpha) . strut_axis
-    remove half from each endpoint
+- **Absent**: No surface interaction — joints fall through the ground plane. Used for zero-gravity shapes (Klein, Möbius).
+- **Bouncy**: Elastic bounce with 50% energy loss, horizontal damping (0.6×), gentle antigravity push proportional to penetration depth.
+- **Frozen**: Complete immobilization at the ground plane. Velocity zeroed, position clamped.
+- **Sticky**: High friction (0.8 downward, drag-based upward), strong antigravity support (50× gravity), depth clamping at 0.1m.
+- **Slippery**: Frictionless horizontal slide on the surface plane, with combined linear + quadratic speed damping.
 
-Like SHAKE, this is exact in one pass because tensegrity struts are independent.
+## Shape Generators
 
-### 7. Ground Collision (one thread per joint)
+### Geodesic Sphere (`tensegrity.rs`)
 
-If a joint has penetrated below the ground plane, its y-position is clamped and its y-velocity is reflected with a restitution coefficient.
+Subdivides an icosahedron to create a geodesic scaffold, then converts each edge into a push strut with twisted joint placement. Pull cables wrap circumferentially and diagonally around the struts. Pre-tension is applied by setting cable ideal lengths to 95% of initial placement distance.
 
-### 8. Post-Collision SHAKE (one thread per rigid strut)
+### Klein Bottle (`klein.rs`)
 
-Ground collision repositioned joints, potentially violating strut length constraints. A second SHAKE pass corrects this.
+Ported from tensegrity-lab. Creates a parametric Klein bottle surface with push struts and pull cables. Width must be even, height must be odd. Push struts share joints (3 struts meet at each joint), requiring spring-push mode. Joints start at random positions within a unit sphere and settle via approach-based ideal length interpolation.
+
+### Möbius Band (`mobius.rs`)
+
+Ported from tensegrity-lab. Creates a zigzag strip with 180° twist. Joint count = 2×segments+1 (odd, for the twist). Each joint connects via pull cables (edge + width) and push struts (diagonal). Uses spring-push mode.
+
+## Settling
+
+### Standard Settling (Spheres)
+
+Runs physics with high drag (100×), no gravity, and a distant ground plane for 2000 iterations in chunks of 200. The pre-tensioned structure converges to its self-stress equilibrium.
+
+### Approach-Based Settling (Klein, Möbius)
+
+For shapes starting from random positions, ideal lengths are interpolated from actual → target over 20 steps of 2000 iterations each (40,000 total). Between steps, the CPU reads back positions, updates ideal lengths (linear interpolation based on progress), and rebuilds the PhysicsCompute with new buffers. After approach completes, 5000 additional iterations run at final target lengths.
 
 ## Single Compute Pass Architecture
 
-All iterations of the above 8-dispatch sequence are recorded into a **single GPU compute pass**. Bind groups (buffer references) are set once at the start; only the pipeline (which shader entry point to run) changes between dispatches.
+All iterations of the dispatch sequence are recorded into a single GPU compute pass. Bind groups are set once; only the pipeline changes between dispatches.
 
-This was a critical optimization. The original implementation used a separate compute pass (begin/end) for each dispatch — 9 passes per iteration, 720 pass transitions per frame at 80 iterations. The overhead of beginning and ending compute passes dominated at high iteration counts, causing the GPU to hang beyond roughly 80 iterations per frame.
-
-With a single pass, the same 80 iterations require just 1 pass transition instead of 720. This enabled scaling to 333+ iterations per frame (matching the CPU reference implementation) and up to 500+ iterations per frame for high-frequency spheres.
-
-## Settling Phase
-
-Before the simulation begins, the structure must find its self-stress equilibrium. Cables are generated with ideal lengths 5% shorter than the initial placement distance, creating pre-tension. But the initial geometry is only approximate — the actual equilibrium shape depends on the interplay of all cable tensions and strut constraints.
-
-The settling phase runs the same physics pipeline with high drag (100x normal), no gravity, and a distant ground plane. Over 2000 iterations, the structure converges to a stable pre-stressed shape. Settled positions are read back to the CPU and used as the initial state for the real simulation.
-
-Settling is batched into chunks of 200 iterations per GPU submission, with a device poll between chunks, to avoid GPU timeout on long settling runs.
+This was a critical optimization. The original implementation used separate compute passes per dispatch — 720 pass transitions per frame at 80 iterations. With a single pass, the same work requires just 1 pass transition.
 
 ## Fixed-Point Force Accumulation
 
-WGSL provides `atomicAdd` for integers but not for floats. Since multiple cables may connect to the same joint, forces must be accumulated atomically. The workaround:
+WGSL provides `atomicAdd` for integers but not for floats. Forces are scaled to integers before atomic addition:
 
     integer_force = float_force * FORCE_SCALE
     atomicAdd(force_buffer[joint], integer_force)
 
-And on readback:
-
-    float_force = float(atomicLoad(force_buffer[joint])) / FORCE_SCALE
-
-The same technique is used for mass accumulation, with a separate scale factor (MASS_SCALE = 10,000).
-
-This introduces two limitations:
-
-- **Quantization**: forces smaller than 1/FORCE_SCALE are rounded to zero. At the current scale factor of 100, the minimum representable force is 0.01 N.
-- **Overflow**: the maximum representable force is approximately 2.1 billion / FORCE_SCALE. At scale 100, this is ~21 million N per joint. With very stiff cables (K > 10^8) under high strain, multiple cables on the same joint can approach this limit.
+This introduces quantization (minimum force = 1/FORCE_SCALE) and risks i32 overflow at high stiffness. The same technique is used for mass accumulation with a separate scale factor (MASS_SCALE = 10,000).
 
 ## Runtime Configuration
 
-Physics parameters are configurable at runtime through a `PhysicsConfig` struct rather than compile-time constants. This includes timestep, iterations per frame, cable stiffness, force scale, drag, speed limit, settle parameters, and ambient joint mass.
+Physics parameters are configurable through a `PhysicsConfig` struct: timestep, iterations per frame, cable stiffness, force scale, drag, speed limit, settle parameters, ambient joint mass, gravity, ground plane Y, and surface character.
 
-A `scaled_for_frequency` method adjusts parameters for higher geodesic frequencies. At higher frequencies, cables become shorter and stiffer (K is inversely proportional to ideal length), requiring a smaller timestep. The scaling reduces dt and increases iterations proportionally above a reference frequency, preserving the same simulated time per frame while maintaining numerical stability.
+A `scaled_for_frequency` method adjusts dt and iteration count for higher geodesic frequencies, maintaining stability as cables shorten and stiffen.
 
-## Discovered Limitations
+Stiffness (K) and pretension are adjustable at runtime via on-screen sliders without re-settling. Surface character can be switched at runtime. Shape selection (sphere frequency, Klein dimensions, Möbius segments) triggers a deferred regeneration and settling cycle — the old structure disappears immediately while the new one generates in the background.
 
-### Stability vs. Frequency
+The `elastic_ideal` and `elastic_k` GPU buffers are created with `COPY_DST`, allowing the CPU to update interval ideal lengths at runtime via `queue.write_buffer` without rebuilding pipelines or bind groups.
 
-Geodesic frequency determines the mesh density. At frequency N, the sphere has 60N^2 joints, 30N^2 struts, and 90N^2 cables, with element lengths proportional to radius/N.
+## Muscle Animation
 
-Cable spring constant is computed as K_at_1m / ideal_length. As frequency increases, cables shorten, and K grows inversely. The Courant-Friedrichs-Lewy (CFL) stability condition for explicit integration of a spring-mass system requires dt < 2/sqrt(K/m). Shorter, stiffer cables tighten this bound.
+The `Twitcher` system animates Möbius bands by modulating pull-cable ideal lengths with a traveling sine wave. Each muscle (pull-edge interval) oscillates sinusoidally with a phase offset based on its position in the sequence, creating peristaltic locomotion.
 
-With the default timestep (250 microseconds) and default cable stiffness (5 million N/m), the simulation is stable through frequency 33 (65,340 joints). At frequency 34, a single joint exceeds the speed limit and is nuked. The `scaled_for_frequency` method extends stability to frequency 40+ by reducing dt above a reference frequency.
+The CPU updates ideal lengths and K values before each physics dispatch. The sine wave parameters (phase speed, amplitude) are tuned for a slow, smooth contraction wave that makes the band cycle around its loop. The system is generic — any shape can provide muscle indices for different animation patterns.
 
-### Ambient Mass Tension
+## Rendering
 
-Every joint carries an "ambient mass" representing connector hardware, independent of the intervals attached to it. This creates a tension at high frequencies:
+The ground surface is rendered as a triangular lattice (three line directions at 60° angles) when a surface is active. It is hidden for zero-gravity shapes and when surface character is Absent.
 
-- **Too much ambient mass**: at frequency 40 with 96,000 joints, the total ambient mass dominates the structural mass. The sphere deforms significantly under gravity because the structure is carrying far more weight than its cables can support at their current stiffness.
-- **Too little ambient mass**: reducing ambient mass makes joints lighter, which means the same cable forces produce larger accelerations. This tightens the CFL stability bound, causing speed limit violations at lower frequencies than with heavier joints.
-- **Zero ambient mass**: without ambient mass, joints that have not yet had interval mass accumulated (at the start of each iteration, before mass accumulation dispatches run) have zero mass, causing division by zero in the velocity update.
-
-There is no ambient mass scaling that improves both deformation and stability simultaneously without also scaling the timestep, which costs frame rate. The current approach leaves ambient mass at its default value and accepts the deformation at high frequencies as physically correct behavior (more total mass on the same-radius sphere).
-
-### Force Scale Precision
-
-The integer fixed-point representation limits both the minimum and maximum representable force. At higher frequencies with shorter elements, the forces per element decrease, making the quantization floor more significant. Conversely, with stiffer cables (K approaching physical Dyneema at 6.7 billion N/m), forces per element can overflow the i32 representation.
-
-Addressing this would require either float atomics (not available in WGSL), a compare-and-swap float accumulation loop, or a fundamentally different force accumulation strategy.
-
-### GPU Command Submission
-
-Even with the single compute pass optimization, there is still one GPU submission per frame (or per settling chunk). The CPU must wait for the GPU to finish before reading back positions. This synchronization point means the CPU and GPU cannot overlap their work during physics frames.
-
-Position readback is mitigated by only performing it every N frames (currently every 3 frames), allowing the GPU to run ahead on physics while the CPU renders with slightly stale positions.
+Intervals are rendered as instanced cylinders. Push struts are silver/thick, pull cables are blue/thin. Radius scales inversely with shape complexity to keep larger structures from looking bulky.

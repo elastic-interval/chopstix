@@ -3,8 +3,10 @@ mod camera;
 mod constants;
 mod gpu;
 mod klein;
+mod mobius;
 mod sphere;
 mod tensegrity;
+mod twitcher;
 
 use winit::event_loop::EventLoop;
 
@@ -12,6 +14,7 @@ use winit::event_loop::EventLoop;
 pub enum ShapeConfig {
     Sphere { frequency: usize },
     Klein { width: usize, height: usize, shift: usize },
+    Mobius { segments: usize },
 }
 
 fn main() {

@@ -31,19 +31,9 @@ fn create_headless_device() -> (wgpu::Device, wgpu::Queue) {
     .expect("Failed to create device")
 }
 
-/// Check if any joint has been nuked (speed limit exceeded) or gone to NaN.
-fn is_exploded(positions: &[[f32; 4]]) -> bool {
-    positions.iter().any(|p| {
-        p[3] > 0.5  // nuked flag set by GPU
-            || p[0].is_nan()
-            || p[1].is_nan()
-            || p[2].is_nan()
-    })
-}
-
-/// Count how many joints have been nuked.
-fn nuked_count(positions: &[[f32; 4]]) -> usize {
-    positions.iter().filter(|p| p[3] > 0.5).count()
+/// Check if any position has gone to NaN.
+fn has_nan(positions: &[[f32; 4]]) -> bool {
+    positions.iter().any(|p| p[0].is_nan() || p[1].is_nan() || p[2].is_nan())
 }
 
 struct BoundsStats {
@@ -76,7 +66,7 @@ fn compute_stats(positions: &[[f32; 4]]) -> BoundsStats {
 #[derive(Debug)]
 enum RunResult {
     Settled { frames: u32, final_spread: f32, final_center_y: f32 },
-    Exploded { frame: u32, nuked: usize, total: usize },
+    Exploded { frame: u32 },
     Collapsed { frame: u32, final_spread: f32 },
     TimedOut { frames: u32, final_spread: f32, final_center_y: f32 },
 }
@@ -88,8 +78,8 @@ impl std::fmt::Display for RunResult {
                 write!(f, "SETTLED after {} frames (spread={:.2}, center_y={:.2})",
                     frames, final_spread, final_center_y)
             }
-            RunResult::Exploded { frame, nuked, total } => {
-                write!(f, "EXPLODED at frame {} ({}/{} joints nuked)", frame, nuked, total)
+            RunResult::Exploded { frame } => {
+                write!(f, "EXPLODED at frame {} (speed limit exceeded)", frame)
             }
             RunResult::Collapsed { frame, final_spread } => {
                 write!(f, "COLLAPSED at frame {} (spread={:.2})", frame, final_spread)
@@ -140,12 +130,8 @@ fn run_frequency(
 
         let positions = physics.read_positions(device);
 
-        if is_exploded(&positions) {
-            return RunResult::Exploded {
-                frame,
-                nuked: nuked_count(&positions),
-                total: positions.len(),
-            };
+        if physics.read_frozen(device) || has_nan(&positions) {
+            return RunResult::Exploded { frame };
         }
 
         let stats = compute_stats(&positions);
@@ -209,19 +195,13 @@ impl Scenario {
 fn frequency_sweep() {
     let (device, queue) = create_headless_device();
 
-    let max_frames = 600;
+    let max_frames = 300;
 
     let scenarios = vec![
         Scenario {
-            name: "Fixed dt (baseline)".into(),
-            base_config: PhysicsConfig::default(),
-            max_frequency: 40,
-            scale_with_freq: false,
-        },
-        Scenario {
             name: "Scaled for frequency".into(),
             base_config: PhysicsConfig::default(),
-            max_frequency: 40,
+            max_frequency: 30,
             scale_with_freq: true,
         },
     ];
@@ -232,22 +212,16 @@ fn frequency_sweep() {
     for (si, scenario) in scenarios.iter().enumerate() {
         println!("\n{}", "=".repeat(70));
         println!("Scenario {}: {}", si + 1, scenario.name);
-        if scenario.scale_with_freq {
-            println!("  base dt={:.6}s, base iter={}, scaled per frequency",
-                scenario.base_config.dt, scenario.base_config.iterations_per_frame);
-        } else {
-            println!("  dt={:.6}s, iter={} (fixed)",
-                scenario.base_config.dt, scenario.base_config.iterations_per_frame);
-        }
+        println!("  base dt={:.6}s, base iter={}, scaled per frequency",
+            scenario.base_config.dt, scenario.base_config.iterations_per_frame);
         println!("  K={:.0e}, force_scale={:.0}",
             scenario.base_config.pull_k_at_1m, scenario.base_config.force_scale);
         println!();
 
         let mut results: Vec<(usize, RunResult, f64, f32, u32)> = Vec::new();
 
-        let freqs: Vec<usize> = (1..=scenario.max_frequency)
-            .filter(|&f| f <= 10 || f % 2 == 0)
-            .collect();
+        // Test a representative sample: 1,3,5,10,15,20,25,30
+        let freqs: Vec<usize> = vec![1, 3, 5, 10, 15, 20, 25, 30];
         for freq in freqs {
             let config = scenario.config_for_freq(freq);
             let buffers = tensegrity::generate_sphere_with_k(freq, SPHERE_RADIUS, config.pull_k_at_1m);

@@ -25,7 +25,7 @@ const SLIDER_STEPS: usize = 30;
 
 pub const FREQ_CHOICES: &[usize] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-    15, 20, 25, 30, 35, 40, 45, 50, 55, 60,
+    12, 14, 16, 18, 20, 22, 24, 26, 28, 30,
 ];
 
 pub const FREQ_BUTTON_WIDTH: f32 = 52.0;
@@ -33,24 +33,29 @@ pub const FREQ_BAR_HEIGHT: f32 = 36.0;
 pub const FREQ_BAR_RIGHT_MARGIN: f32 = 16.0;
 pub const FREQ_BAR_TOP: f32 = 12.0;
 
-/// Klein grid: 3 rows × 10 columns of (width, height) pairs.
-/// Width must be even, height must be odd. Max 300 in either dimension.
-/// Each row holds a constant product (≈ joint count), varying aspect ratio
-/// from tall/narrow (left) to wide/short (right).
-pub const KLEIN_GRID: &[&[(usize, usize)]] = &[
-    // Row 0: product ≈ 2000 (~1000 joints) — narrow to wide
-    &[(4, 299), (6, 251), (8, 201), (10, 163), (14, 127), (20, 101), (28, 71), (40, 51), (56, 37), (76, 27)],
-    // Row 1: product ≈ 8000 (~4000 joints)
-    &[(6, 299), (10, 251), (16, 201), (24, 163), (32, 127), (44, 101), (60, 77), (82, 55), (110, 41), (148, 31)],
-    // Row 2: product ≈ 24000 (~12000 joints)
-    &[(14, 299), (22, 253), (34, 201), (48, 163), (66, 127), (82, 101), (108, 77), (146, 57), (200, 41), (296, 29)],
+/// Klein choices: curated (width, height) pairs, sorted by joint count.
+/// Width must be even, height must be odd.
+pub const KLEIN_CHOICES: &[(usize, usize)] = &[
+    (10, 165), (16, 201), (66, 127), (82, 101), (110, 41), (146, 57), (200, 101),
 ];
-pub const KLEIN_GRID_COLS: usize = 10;
-pub const KLEIN_GRID_ROWS: usize = 3;
-pub const KLEIN_BUTTON_WIDTH: f32 = 100.0;
+pub const KLEIN_COLS: usize = 7;
+pub const KLEIN_BUTTON_WIDTH: f32 = 97.2; // 9 chars × 10.8px (18px monospace)
 pub const KLEIN_ROW_HEIGHT: f32 = 30.0;
 pub const KLEIN_GRID_TOP: f32 = 54.0;
 pub const KLEIN_GRID_RIGHT_MARGIN: f32 = 16.0;
+
+/// Möbius segment choices — single row
+pub const MOBIUS_CHOICES: &[usize] = &[
+    10, 15, 20, 30, 40,
+];
+pub const MOBIUS_BUTTON_WIDTH: f32 = 54.0; // 5 chars × 10.8px (18px monospace)
+pub const MOBIUS_ROW_HEIGHT: f32 = 30.0;
+pub const MOBIUS_BAR_TOP: f32 = 88.0; // below Klein bar (54 + 30 + 4)
+
+/// Surface character buttons
+pub const SURFACE_BAR_TOP: f32 = 122.0; // below Möbius bar
+pub const SURFACE_BUTTON_WIDTH: f32 = 108.0; // 10 chars × 10.8px (18px monospace)
+pub const SURFACE_BAR_HEIGHT: f32 = 30.0;
 
 /// X offset for each slider column
 const SLIDER_COL_1: f32 = 10.0;
@@ -69,8 +74,11 @@ pub struct Hud {
     info_buffer: Buffer,
     stiffness_slider: Buffer,
     pretension_slider: Buffer,
+    shape_title_buffer: Buffer,
     freq_buffer: Buffer,
-    klein_grid_buffers: Vec<Buffer>,
+    klein_buffer: Buffer,
+    mobius_buffer: Buffer,
+    surface_buffer: Buffer,
     screen_width: f32,
     screen_height: f32,
 }
@@ -110,18 +118,24 @@ impl Hud {
         let mut pretension_slider = Buffer::new(&mut font_system, slider_metrics);
         pretension_slider.set_size(&mut font_system, Some(SLIDER_COL_WIDTH), Some(1000.0));
 
+        let mut shape_title_buffer = Buffer::new(&mut font_system, Metrics::new(32.0, 40.0));
+        shape_title_buffer.set_size(&mut font_system, Some(800.0), Some(50.0));
+
         let freq_width = FREQ_CHOICES.len() as f32 * FREQ_BUTTON_WIDTH + 20.0;
         let mut freq_buffer = Buffer::new(&mut font_system, Metrics::new(22.0, FREQ_BAR_HEIGHT));
         freq_buffer.set_size(&mut font_system, Some(freq_width), Some(FREQ_BAR_HEIGHT + 4.0));
 
-        let klein_row_width = KLEIN_GRID_COLS as f32 * KLEIN_BUTTON_WIDTH + 20.0;
-        let klein_grid_buffers: Vec<Buffer> = (0..KLEIN_GRID_ROWS)
-            .map(|_| {
-                let mut buf = Buffer::new(&mut font_system, Metrics::new(18.0, KLEIN_ROW_HEIGHT));
-                buf.set_size(&mut font_system, Some(klein_row_width), Some(KLEIN_ROW_HEIGHT + 4.0));
-                buf
-            })
-            .collect();
+        let klein_width = KLEIN_COLS as f32 * KLEIN_BUTTON_WIDTH + 20.0;
+        let mut klein_buffer = Buffer::new(&mut font_system, Metrics::new(18.0, KLEIN_ROW_HEIGHT));
+        klein_buffer.set_size(&mut font_system, Some(klein_width), Some(KLEIN_ROW_HEIGHT + 4.0));
+
+        let mobius_width = MOBIUS_CHOICES.len() as f32 * MOBIUS_BUTTON_WIDTH + 20.0;
+        let mut mobius_buffer = Buffer::new(&mut font_system, Metrics::new(18.0, MOBIUS_ROW_HEIGHT));
+        mobius_buffer.set_size(&mut font_system, Some(mobius_width), Some(MOBIUS_ROW_HEIGHT + 4.0));
+
+        let surface_width = 5.0 * SURFACE_BUTTON_WIDTH + 20.0;
+        let mut surface_buffer = Buffer::new(&mut font_system, Metrics::new(18.0, SURFACE_BAR_HEIGHT));
+        surface_buffer.set_size(&mut font_system, Some(surface_width), Some(SURFACE_BAR_HEIGHT + 4.0));
 
         Self {
             font_system,
@@ -134,8 +148,11 @@ impl Hud {
             info_buffer,
             stiffness_slider,
             pretension_slider,
+            shape_title_buffer,
             freq_buffer,
-            klein_grid_buffers,
+            klein_buffer,
+            mobius_buffer,
+            surface_buffer,
             screen_width: 1280.0,
             screen_height: 600.0,
         }
@@ -155,6 +172,16 @@ impl Hud {
             None,
         );
         self.title_buffer.shape_until_scroll(&mut self.font_system, false);
+    }
+
+    pub fn set_shape_title(&mut self, text: &str) {
+        self.shape_title_buffer.set_text(
+            &mut self.font_system,
+            text,
+            &mono(TITLE_COLOR),
+            Shaping::Basic,
+        );
+        self.shape_title_buffer.shape_until_scroll(&mut self.font_system, false);
     }
 
     pub fn set_legend(&mut self, lines: &[(&str, &str)]) {
@@ -254,43 +281,94 @@ impl Hud {
         Self::build_slider(&mut self.pretension_slider, &mut self.font_system, t, label, PRETENSION_FILL, PRETENSION_LABEL, hovered);
     }
 
-    pub fn set_klein_grid(
+    pub fn set_klein_bar(
         &mut self,
         current_width: usize,
         current_height: usize,
-        hover: Option<(usize, usize)>, // (row, col)
+        hover_index: Option<usize>,
     ) {
-        for (row_idx, row) in KLEIN_GRID.iter().enumerate() {
-            let mut spans: Vec<(String, Attrs)> = Vec::new();
-            for (col_idx, &(w, h)) in row.iter().enumerate() {
-                let label = format!("{:>3}x{:<4}", w, h);
-                let color = if w == current_width && h == current_height {
-                    FREQ_ACTIVE
-                } else if hover == Some((row_idx, col_idx)) {
-                    FREQ_HOVER
-                } else {
-                    FREQ_NORMAL
-                };
-                spans.push((label, mono(color)));
-                // padding
-                if col_idx < row.len() - 1 {
-                    spans.push(("  ".to_string(), mono(FREQ_NORMAL)));
-                }
-            }
-            let borrowed: Vec<(&str, Attrs)> = spans.iter().map(|(s, a)| (s.as_str(), a.clone())).collect();
-            self.klein_grid_buffers[row_idx].set_rich_text(
-                &mut self.font_system,
-                borrowed,
-                &mono(FREQ_NORMAL),
-                Shaping::Basic,
-                None,
-            );
-            self.klein_grid_buffers[row_idx].shape_until_scroll(&mut self.font_system, false);
+        let mut spans: Vec<(String, Attrs)> = Vec::new();
+        for (i, &(w, h)) in KLEIN_CHOICES.iter().enumerate() {
+            let label = format!("{:>3}x{:<5}", w, h); // 9 chars total
+            let color = if w == current_width && h == current_height {
+                FREQ_ACTIVE
+            } else if hover_index == Some(i) {
+                FREQ_HOVER
+            } else {
+                FREQ_NORMAL
+            };
+            spans.push((label, mono(color)));
         }
+        let borrowed: Vec<(&str, Attrs)> = spans.iter().map(|(s, a)| (s.as_str(), a.clone())).collect();
+        self.klein_buffer.set_rich_text(
+            &mut self.font_system,
+            borrowed,
+            &mono(FREQ_NORMAL),
+            Shaping::Basic,
+            None,
+        );
+        self.klein_buffer.shape_until_scroll(&mut self.font_system, false);
     }
 
-    pub fn klein_grid_left(&self) -> f32 {
-        self.screen_width - KLEIN_GRID_COLS as f32 * KLEIN_BUTTON_WIDTH - KLEIN_GRID_RIGHT_MARGIN
+    pub fn set_mobius_bar(&mut self, current_segments: usize, hover_index: Option<usize>) {
+        let mut spans: Vec<(String, Attrs)> = Vec::new();
+        for (i, &seg) in MOBIUS_CHOICES.iter().enumerate() {
+            let label = format!("{:>4} ", seg); // 5 chars
+            let color = if seg == current_segments {
+                FREQ_ACTIVE
+            } else if hover_index == Some(i) {
+                FREQ_HOVER
+            } else {
+                FREQ_NORMAL
+            };
+            spans.push((label, mono(color)));
+        }
+        let borrowed: Vec<(&str, Attrs)> = spans.iter().map(|(s, a)| (s.as_str(), a.clone())).collect();
+        self.mobius_buffer.set_rich_text(
+            &mut self.font_system,
+            borrowed,
+            &mono(FREQ_NORMAL),
+            Shaping::Basic,
+            None,
+        );
+        self.mobius_buffer.shape_until_scroll(&mut self.font_system, false);
+    }
+
+    pub fn set_surface_bar(&mut self, current: u32, hover_index: Option<usize>) {
+        let names = ["Absent", "Bouncy", "Frozen", "Sticky", "Slippery"];
+        let mut spans: Vec<(String, Attrs)> = Vec::new();
+        for (i, name) in names.iter().enumerate() {
+            let label = format!(" {:^9}", name);
+            let color = if i as u32 == current {
+                FREQ_ACTIVE
+            } else if hover_index == Some(i) {
+                FREQ_HOVER
+            } else {
+                FREQ_NORMAL
+            };
+            spans.push((label, mono(color)));
+        }
+        let borrowed: Vec<(&str, Attrs)> = spans.iter().map(|(s, a)| (s.as_str(), a.clone())).collect();
+        self.surface_buffer.set_rich_text(
+            &mut self.font_system,
+            borrowed,
+            &mono(FREQ_NORMAL),
+            Shaping::Basic,
+            None,
+        );
+        self.surface_buffer.shape_until_scroll(&mut self.font_system, false);
+    }
+
+    pub fn klein_bar_left(&self) -> f32 {
+        self.screen_width - KLEIN_COLS as f32 * KLEIN_BUTTON_WIDTH - KLEIN_GRID_RIGHT_MARGIN
+    }
+
+    pub fn mobius_bar_left(&self) -> f32 {
+        self.screen_width - MOBIUS_CHOICES.len() as f32 * MOBIUS_BUTTON_WIDTH - FREQ_BAR_RIGHT_MARGIN
+    }
+
+    pub fn surface_bar_left(&self) -> f32 {
+        self.screen_width - 5.0 * SURFACE_BUTTON_WIDTH - FREQ_BAR_RIGHT_MARGIN
     }
 
     pub fn freq_bar_left(&self) -> f32 {
@@ -361,6 +439,16 @@ impl Hud {
                 default_color: TITLE_COLOR,
                 custom_glyphs: &[],
             },
+            // Centered shape title
+            TextArea {
+                buffer: &self.shape_title_buffer,
+                left: (self.screen_width - 800.0) * 0.5,
+                top: 12.0,
+                scale: 1.0,
+                bounds,
+                default_color: TITLE_COLOR,
+                custom_glyphs: &[],
+            },
             TextArea {
                 buffer: &self.legend_buffer,
                 left: 16.0,
@@ -410,19 +498,38 @@ impl Hud {
             },
         ];
 
-        // Klein grid rows
-        let klein_left = self.klein_grid_left();
-        for (row_idx, buf) in self.klein_grid_buffers.iter().enumerate() {
-            text_areas.push(TextArea {
-                buffer: buf,
-                left: klein_left,
-                top: KLEIN_GRID_TOP + row_idx as f32 * KLEIN_ROW_HEIGHT,
-                scale: 1.0,
-                bounds,
-                default_color: FREQ_NORMAL,
-                custom_glyphs: &[],
-            });
-        }
+        // Klein bar
+        text_areas.push(TextArea {
+            buffer: &self.klein_buffer,
+            left: self.klein_bar_left(),
+            top: KLEIN_GRID_TOP,
+            scale: 1.0,
+            bounds,
+            default_color: FREQ_NORMAL,
+            custom_glyphs: &[],
+        });
+
+        // Möbius bar
+        text_areas.push(TextArea {
+            buffer: &self.mobius_buffer,
+            left: self.mobius_bar_left(),
+            top: MOBIUS_BAR_TOP,
+            scale: 1.0,
+            bounds,
+            default_color: FREQ_NORMAL,
+            custom_glyphs: &[],
+        });
+
+        // Surface character bar
+        text_areas.push(TextArea {
+            buffer: &self.surface_buffer,
+            left: self.surface_bar_left(),
+            top: SURFACE_BAR_TOP,
+            scale: 1.0,
+            bounds,
+            default_color: FREQ_NORMAL,
+            custom_glyphs: &[],
+        });
 
         self.text_renderer
             .prepare(

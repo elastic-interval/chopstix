@@ -63,11 +63,6 @@ struct Spoke {
     length: f32,
 }
 
-#[allow(dead_code)]
-pub fn generate_sphere(frequency: usize, radius: f32) -> TensegritySphereBuffers {
-    generate_sphere_with_k(frequency, radius, PULL_K_AT_1M)
-}
-
 pub fn generate_sphere_with_k(frequency: usize, radius: f32, pull_k_at_1m: f32) -> TensegritySphereBuffers {
     use Cell::*;
 

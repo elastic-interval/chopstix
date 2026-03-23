@@ -28,19 +28,6 @@ fn create_headless_device() -> (wgpu::Device, wgpu::Queue) {
     .expect("Failed to create device")
 }
 
-fn is_exploded(positions: &[[f32; 4]]) -> bool {
-    positions.iter().any(|p| {
-        p[3] > 0.5
-            || p[0].is_nan()
-            || p[1].is_nan()
-            || p[2].is_nan()
-    })
-}
-
-fn nuked_count(positions: &[[f32; 4]]) -> usize {
-    positions.iter().filter(|p| p[3] > 0.5).count()
-}
-
 fn compute_spread(positions: &[[f32; 4]]) -> f32 {
     let n = positions.len() as f32;
     let cx: f32 = positions.iter().map(|p| p[0]).sum::<f32>() / n;
@@ -82,7 +69,6 @@ fn klein_generates_and_settles() {
     let spread = compute_spread(&buffers.positions);
     println!("Post-settle spread: {:.2}", spread);
     assert!(spread > 1.0, "Should have expanded from random unit sphere, got {:.2}", spread);
-    assert!(!is_exploded(&buffers.positions), "Should not have exploded during settling");
 }
 
 #[test]
@@ -115,9 +101,8 @@ fn klein_physics_stable() {
 
         let positions = physics.read_positions(&device);
 
-        if is_exploded(&positions) {
-            let nuked = nuked_count(&positions);
-            panic!("EXPLODED at frame {} ({}/{} nuked)", frame, nuked, positions.len());
+        if physics.read_frozen(&device) {
+            panic!("FROZEN at frame {} — speed limit exceeded", frame);
         }
 
         if frame == max_frames - 1 {

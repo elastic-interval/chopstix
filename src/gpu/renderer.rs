@@ -220,7 +220,12 @@ impl Renderer {
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&mvp.to_cols_array()));
     }
 
-    pub fn update_instances(&mut self, device: &wgpu::Device, positions: &[[f32; 4]]) {
+    pub fn update_instances(&mut self, device: &wgpu::Device, positions: &[[f32; 4]], show_ground: bool) {
+        if positions.is_empty() {
+            self.num_instances = 0;
+            self.instance_buffer = None;
+            return;
+        }
         let total_struts = self.rigid_alpha.len() + self.push_alpha.len();
         let mut instances = Vec::with_capacity(total_struts + self.elastic_alpha.len());
 
@@ -263,27 +268,52 @@ impl Renderer {
             });
         }
 
-        // Ground grid
+        // Ground grid (only when surface is active)
+        if !show_ground {
+            self.num_instances = instances.len() as u32;
+            if self.num_instances > 0 {
+                self.instance_buffer = Some(device.create_buffer_init(
+                    &wgpu::util::BufferInitDescriptor {
+                        label: Some("Instance Buffer"),
+                        contents: bytemuck::cast_slice(&instances),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    },
+                ));
+            }
+            return;
+        }
+        // Triangular ground lattice: 3 families of parallel lines at 0°, 60°, 120°.
+        // Each family includes a line through the origin. Lines are spaced
+        // perpendicular to their direction by grid_spacing.
         let grid_extent = 50.0f32;
         let grid_spacing = 5.0f32;
         let grid_color = [0.25, 0.3, 0.25, 1.0];
-        let mut x = -grid_extent;
-        while x <= grid_extent {
-            instances.push(CylinderInstance {
-                start: [x, GROUND_Y, -grid_extent],
-                radius_factor: 0.5,
-                end: [x, GROUND_Y, grid_extent],
-                material_type: 0,
-                color: grid_color,
-            });
-            instances.push(CylinderInstance {
-                start: [-grid_extent, GROUND_Y, x],
-                radius_factor: 0.5,
-                end: [grid_extent, GROUND_Y, x],
-                material_type: 0,
-                color: grid_color,
-            });
-            x += grid_spacing;
+
+        // For each direction: (dir_x, dir_z) is the line direction,
+        // (perp_x, perp_z) is the perpendicular offset direction.
+        let directions: [(f32, f32, f32, f32); 3] = [
+            // 0°: lines along X, offset along Z
+            (1.0, 0.0, 0.0, 1.0),
+            // 60°: lines along (cos60, sin60), offset along (-sin60, cos60)
+            (0.5, 0.866025, -0.866025, 0.5),
+            // 120°: lines along (cos120, sin120), offset along (-sin120, cos120)
+            (-0.5, 0.866025, -0.866025, -0.5),
+        ];
+
+        for (dx, dz, px, pz) in directions {
+            let n_lines = (grid_extent / grid_spacing) as i32;
+            for i in -n_lines..=n_lines {
+                let offset = i as f32 * grid_spacing;
+                let cx = px * offset;
+                let cz = pz * offset;
+                instances.push(CylinderInstance {
+                    start: [cx - dx * grid_extent, GROUND_Y, cz - dz * grid_extent],
+                    radius_factor: 0.4,
+                    end: [cx + dx * grid_extent, GROUND_Y, cz + dz * grid_extent],
+                    material_type: 0,
+                    color: grid_color,
+                });
+            }
         }
 
         self.num_instances = instances.len() as u32;

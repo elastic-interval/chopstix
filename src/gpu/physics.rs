@@ -19,6 +19,7 @@ pub struct PhysicsConfig {
     pub ambient_mass: f32,
     pub gravity: f32,
     pub ground_y: f32,
+    pub surface_character: u32, // 0=bouncy, 1=frozen, 2=sticky, 3=slippery
 }
 
 impl Default for PhysicsConfig {
@@ -35,9 +36,18 @@ impl Default for PhysicsConfig {
             ambient_mass: JOINT_AMBIENT_MASS,
             gravity: GRAVITY,
             ground_y: GROUND_Y,
+            surface_character: 0, // bouncy
         }
     }
 }
+
+#[allow(dead_code)] pub const SURFACE_ABSENT: u32 = 0;
+#[allow(dead_code)] pub const SURFACE_BOUNCY: u32 = 1;
+#[allow(dead_code)] pub const SURFACE_FROZEN: u32 = 2;
+#[allow(dead_code)] pub const SURFACE_STICKY: u32 = 3;
+#[allow(dead_code)] pub const SURFACE_SLIPPERY: u32 = 4;
+
+pub const SURFACE_NAMES: &[&str] = &["Absent", "Bouncy", "Frozen", "Sticky", "Slippery"];
 
 impl PhysicsConfig {
     /// Scale dt and iterations for a given geodesic frequency.
@@ -65,17 +75,17 @@ struct PhysicsParams {
     dt: f32,
     gravity: f32,
     drag: f32,
-    viscosity: f32,
+    _reserved0: f32,
     num_joints: u32,
     num_elastic: u32,
     num_rigid: u32,
     ambient_mass: f32,
     force_scale: f32,
     ground_y: f32,
-    restitution: f32,
+    _reserved1: f32,
     speed_limit: f32,
     num_push: u32,
-    _pad1: u32,
+    surface_character: u32,
     _pad2: u32,
     _pad3: u32,
 }
@@ -94,7 +104,11 @@ pub struct PhysicsCompute {
     ground_collision_pipeline: wgpu::ComputePipeline,
     push_forces_pipeline: wgpu::ComputePipeline,
     position_buffer: wgpu::Buffer,
+    elastic_ideal_buffer: wgpu::Buffer,
+    elastic_k_buffer: wgpu::Buffer,
+    frozen_buffer: wgpu::Buffer,
     staging_buffer: wgpu::Buffer,
+    frozen_staging_buffer: wgpu::Buffer,
     num_joints: u32,
     num_elastic: u32,
     num_rigid: u32,
@@ -116,17 +130,17 @@ impl PhysicsCompute {
             dt: config.dt,
             gravity: 0.0,           // no gravity during settling
             drag: config.settle_drag,
-            viscosity: 0.0,
+            _reserved0: 0.0,
             num_joints,
             num_elastic: buffers.num_elastic(),
             num_rigid: buffers.num_rigid(),
             ambient_mass: config.ambient_mass,
             force_scale: config.force_scale,
             ground_y: -1e6,         // ground far away — irrelevant
-            restitution: 0.0,
+            _reserved1: 0.0,
             speed_limit: f32::MAX,  // no speed limit during settling
             num_push: buffers.num_push(),
-            _pad1: 0,
+            surface_character: 0,
             _pad2: 0,
             _pad3: 0,
         };
@@ -220,17 +234,17 @@ impl PhysicsCompute {
                 dt: config.dt,
                 gravity: 0.0,
                 drag: config.settle_drag,
-                viscosity: 0.0,
+                _reserved0: 0.0,
                 num_joints: buffers.num_joints(),
                 num_elastic: buffers.num_elastic(),
                 num_rigid: buffers.num_rigid(),
                 ambient_mass: config.ambient_mass,
                 force_scale: config.force_scale,
                 ground_y: -1e6,
-                restitution: 0.0,
+                _reserved1: 0.0,
                 speed_limit: f32::MAX,
                 num_push: buffers.num_push(),
-                _pad1: 0,
+                surface_character: 0,
                 _pad2: 0,
                 _pad3: 0,
             };
@@ -276,17 +290,17 @@ impl PhysicsCompute {
             dt: config.dt,
             gravity: 0.0,
             drag: config.settle_drag,
-            viscosity: 0.0,
+            _reserved0: 0.0,
             num_joints: buffers.num_joints(),
             num_elastic: buffers.num_elastic(),
             num_rigid: buffers.num_rigid(),
             ambient_mass: config.ambient_mass,
             force_scale: config.force_scale,
             ground_y: -1e6,
-            restitution: 0.0,
+            _reserved1: 0.0,
             speed_limit: f32::MAX,
             num_push: buffers.num_push(),
-            _pad1: 0,
+            surface_character: 0,
             _pad2: 0,
             _pad3: 0,
         };
@@ -318,17 +332,17 @@ impl PhysicsCompute {
             dt: config.dt,
             gravity: config.gravity,
             drag: config.drag,
-            viscosity: VISCOSITY,
+            _reserved0: 0.0,
             num_joints: buffers.num_joints(),
             num_elastic: buffers.num_elastic(),
             num_rigid: buffers.num_rigid(),
             ambient_mass: config.ambient_mass,
             force_scale: config.force_scale,
             ground_y: config.ground_y,
-            restitution: RESTITUTION,
+            _reserved1: 0.0,
             speed_limit: config.speed_limit,
             num_push: buffers.num_push(),
-            _pad1: 0,
+            surface_character: config.surface_character,
             _pad2: 0,
             _pad3: 0,
         };
@@ -385,11 +399,18 @@ impl PhysicsCompute {
             usage: wgpu::BufferUsages::STORAGE,
         });
 
+        // Frozen flag (atomic u32, 0 = running, 1 = speed limit exceeded)
+        let frozen_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Frozen"),
+            contents: bytemuck::bytes_of(&0u32),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+
         // Elastic interval buffers
         let elastic_alpha_buf = create_storage_buffer(device, "Elastic Alpha", bytemuck::cast_slice(&buffers.elastic_alpha));
         let elastic_omega_buf = create_storage_buffer(device, "Elastic Omega", bytemuck::cast_slice(&buffers.elastic_omega));
-        let elastic_ideal_buf = create_storage_buffer(device, "Elastic Ideal", bytemuck::cast_slice(&buffers.elastic_ideal));
-        let elastic_k_buf = create_storage_buffer(device, "Elastic K", bytemuck::cast_slice(&buffers.elastic_k));
+        let elastic_ideal_buf = create_writable_storage_buffer(device, "Elastic Ideal", bytemuck::cast_slice(&buffers.elastic_ideal));
+        let elastic_k_buf = create_writable_storage_buffer(device, "Elastic K", bytemuck::cast_slice(&buffers.elastic_k));
 
         // Rigid interval buffers
         let rigid_alpha_buf = create_storage_buffer(device, "Rigid Alpha", bytemuck::cast_slice(&buffers.rigid_alpha));
@@ -418,6 +439,14 @@ impl PhysicsCompute {
             mapped_at_creation: false,
         });
 
+        // Staging buffer for frozen flag readback
+        let frozen_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Frozen Staging"),
+            size: 4,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // Bind group layouts
         let joint_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Joint BGL"),
@@ -428,6 +457,7 @@ impl PhysicsCompute {
                 storage_entry(3, false), // force_y
                 storage_entry(4, false), // force_z
                 storage_entry(5, false), // masses
+                storage_entry(6, false), // frozen
             ],
         });
 
@@ -481,6 +511,7 @@ impl PhysicsCompute {
                 wgpu::BindGroupEntry { binding: 3, resource: force_y_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: force_z_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: mass_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: frozen_buffer.as_entire_binding() },
             ],
         });
 
@@ -566,7 +597,11 @@ impl PhysicsCompute {
             ground_collision_pipeline,
             push_forces_pipeline,
             position_buffer,
+            elastic_ideal_buffer: elastic_ideal_buf,
+            elastic_k_buffer: elastic_k_buf,
+            frozen_buffer,
             staging_buffer,
+            frozen_staging_buffer,
             num_joints,
             num_elastic,
             num_rigid,
@@ -674,6 +709,13 @@ impl PhysicsCompute {
             0,
             (self.num_joints as u64) * 16,
         );
+        encoder.copy_buffer_to_buffer(
+            &self.frozen_buffer,
+            0,
+            &self.frozen_staging_buffer,
+            0,
+            4,
+        );
     }
 
     pub fn read_positions(&self, device: &wgpu::Device) -> Vec<[f32; 4]> {
@@ -692,6 +734,44 @@ impl PhysicsCompute {
         positions
     }
 
+    /// Check if the simulation has frozen due to a speed limit violation.
+    pub fn read_frozen(&self, device: &wgpu::Device) -> bool {
+        let buffer_slice = self.frozen_staging_buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).unwrap();
+        });
+        device.poll(wgpu::PollType::Wait).unwrap();
+        receiver.recv().unwrap().unwrap();
+
+        let data = buffer_slice.get_mapped_range();
+        let value: u32 = *bytemuck::from_bytes(&data);
+        drop(data);
+        self.frozen_staging_buffer.unmap();
+        value != 0
+    }
+
+    /// Write updated ideal lengths and K values to the GPU buffers.
+    /// Used for muscle twitching and other runtime interval modifications.
+    pub fn write_elastic_ideals(&self, queue: &wgpu::Queue, ideals: &[f32], ks: &[f32]) {
+        if !ideals.is_empty() {
+            queue.write_buffer(&self.elastic_ideal_buffer, 0, bytemuck::cast_slice(ideals));
+        }
+        if !ks.is_empty() {
+            queue.write_buffer(&self.elastic_k_buffer, 0, bytemuck::cast_slice(ks));
+        }
+    }
+
+}
+
+/// Create a storage buffer that can be updated from the CPU via queue.write_buffer.
+fn create_writable_storage_buffer(device: &wgpu::Device, label: &str, data: &[u8]) -> wgpu::Buffer {
+    let contents = if data.is_empty() { &[0u8; 4] } else { data };
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    })
 }
 
 /// Create a storage buffer from a slice, using a single zero element if the slice is empty.

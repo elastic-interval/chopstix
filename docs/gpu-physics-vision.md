@@ -1,36 +1,35 @@
 # Chopstix: GPU Tensegrity Physics — Status & Path Forward
 
-This document captures what has been built, what we learned, and what needs to happen next to make GPU physics decisively faster than the CPU-based tensegrity-lab.
+This document captures what has been built, what we learned, and what needs to happen next.
 
 ## What Exists
 
-Chopstix is a GPU-accelerated tensegrity sphere simulator. It generates geodesic tensegrity spheres at any frequency, drops them onto a ground plane, and renders the result in real time using wgpu compute shaders.
+Chopstix is a GPU-accelerated tensegrity simulator supporting three shape types: geodesic spheres, Klein bottles, and Möbius bands. Physics runs entirely on GPU compute shaders via wgpu. All shapes can be selected at runtime through on-screen buttons.
 
 ### Architecture
 
-**Data layout**: Struct-of-arrays for GPU-coalesced access. Joint positions/velocities are `vec4<f32>` arrays. Forces use `atomic<i32>` with a scale factor for parallel accumulation. Interval topology (endpoints, ideal lengths, spring constants) is uploaded once.
+**Data layout**: Struct-of-arrays for GPU-coalesced access. Joint positions/velocities are `vec4<f32>` arrays. Forces use `atomic<i32>` with a scale factor for parallel accumulation. A single `atomic<u32>` frozen flag halts the simulation globally when any joint exceeds the speed limit.
 
-**Physics pipeline**: Velocity Verlet integration with 9 compute passes per iteration:
+**Two physics modes**:
 
-| Pass | Domain | Purpose |
-|------|--------|---------|
-| 1. half_kick_and_drift | joints | v += 0.5·F/m·dt, x += v·dt |
-| 2. shake_constraints | rigid intervals | SHAKE: correct positions to maintain strut lengths |
-| 3. reset_forces | joints | Zero force accumulators, reset mass to ambient |
-| 4. elastic_forces | elastic intervals | Hooke's law with slack detection for cables |
-| 5. rigid_mass | rigid intervals | Distribute strut mass to endpoint joints |
-| 6. second_half_kick | joints | Add gravity, v += 0.5·F/m·dt, apply drag |
-| 7. rattle_constraints | rigid intervals | RATTLE: project out velocity along strut axes |
-| 8. ground_collision | joints | Bounce off ground plane with restitution |
-| 9. post_collision_shake | rigid intervals | Fix constraint violations from ground repositioning |
+- **SHAKE/RATTLE** (spheres): Push intervals as rigid geometric constraints. 8 dispatches per iteration. Exploits the tensegrity property that no two struts share a joint, making all constraints independent.
+- **Spring-push** (Klein, Möbius): Push intervals as stiff springs with atomic force accumulation. 5 dispatches per iteration. Handles shared-joint topologies where SHAKE would race.
 
-**Rigid push intervals** use SHAKE/RATTLE geometric constraints instead of penalty springs. This is unconditionally stable — no spring constant, no stiffness-dependent timestep limit. In tensegrity, no two push intervals share a joint, so all constraints are independent and a single pass is exact.
+**Surface characters**: Five ground interaction modes — Absent (no surface), Bouncy, Frozen, Sticky, Slippery. Switchable at runtime. The ground is rendered as a triangular lattice when active.
 
-**Elastic pull intervals** (cables) use Hooke's law: `F = k · strain · ideal_length`, with `k = K_AT_1M / ideal_length`. Cables go slack (zero force) when compressed. Cable mass is distributed to endpoint joints.
+**Shape generators**:
+- Geodesic spheres at any frequency (1–60+), with SHAKE/RATTLE rigid struts
+- Klein bottles with parametric (width, height), 3 rows × 10 columns of presets varying aspect ratio at constant joint count
+- Möbius bands with configurable segment count, 10 presets
 
-**Speed limit**: Joints exceeding a velocity threshold are "nuked" — velocity zeroed, position frozen, flag propagated to the position buffer's w component so the CPU can detect failure without a full readback.
+### Runtime Controls
 
-**Settling phase**: Before the simulation starts, runs physics with high drag (100) and no gravity for 2000 iterations to let the pre-tensioned structure find its self-stress equilibrium. Positions are read back and used as initial state for the real simulation.
+- **Shape selection**: Sphere frequency bar, Klein grid (3×10), Möbius segment bar — all always visible, click to switch
+- **Stiffness slider**: Log scale K ∈ [10³, 10¹⁰] N/m
+- **Pretension slider**: Cable ideal length scaling 0.5–1.0
+- **Surface character**: 5 clickable buttons
+- **Camera**: Mouse orbit, scroll zoom, auto-tracking centroid
+- **Space**: Pause/resume (starts unpaused)
 
 ### Current Parameters
 
@@ -41,127 +40,79 @@ Chopstix is a GPU-accelerated tensegrity sphere simulator. It generates geodesic
 | Iterations/frame | 80 | tensegrity-lab does ~333 |
 | Sim time/frame | 20 ms | Both run ≈ real-time at 60fps |
 | Drag | 0.5 | Per-step: v *= 0.99988 |
-| Speed limit | 100 m/s | Catches instability before cascade |
+| Speed limit | 100 m/s | Triggers global freeze |
 | Pre-tension | 5% | Cable ideal = 0.95 × initial distance |
-| Initial position scale | 0.95 | Places joints near cable equilibrium |
 
 ### Test Infrastructure
 
-`tests/frequency_stress.rs` — headless GPU test that sweeps frequencies 1→20, settles each sphere, drops it, waits for ground contact + settling, and reports results. Detects explosion via nuked joints. Current results: **freq 1–14 stable** (up to 11,760 joints, 5,880 struts, 17,640 cables).
-
-Run with: `cargo test --release --test frequency_stress --no-run` then execute the binary directly with `--nocapture` for output.
+- `tests/frequency_stress.rs` — headless GPU test sweeping sphere frequencies with fixed and scaled configs. Detects explosion via frozen flag. Current max stable: freq 32 (fixed dt), freq 40+ (scaled).
+- `tests/klein_stress.rs` — headless Klein bottle generation, approach-based settling, and physics stability over 300 frames.
 
 ## What We Learned
 
 ### The dispatch overhead wall
 
-This is the critical bottleneck. Each physics iteration requires 9 separate compute dispatches (one per pass). At 80 iterations/frame, that's 720 dispatches. Pushing beyond ~80 iterations causes the GPU command submission overhead to dominate — the test hangs and the app beach-balls.
+Each physics iteration requires multiple compute dispatches. At 80 iterations/frame with 8 dispatches each, that's 640 dispatches. The single compute pass optimization (all dispatches in one pass, one submission) was critical — the original per-pass architecture hung beyond ~80 iterations.
 
-This means we cannot simply reduce dt and increase iterations to support stiffer cables. At 333 iterations/frame (matching tensegrity-lab), we'd need 2,997 dispatches — roughly 4× beyond what currently works.
+Spring-push mode helps here: 5 dispatches instead of 8, enabling more iterations at the same overhead budget.
 
-**This is the single biggest obstacle to outperforming tensegrity-lab.** The CPU version does 333 iterations per frame with zero dispatch overhead — it's just a tight loop. Our GPU version parallelizes each iteration across thousands of joints, but pays a heavy per-iteration tax.
+### Approach-based settling for random-start topologies
 
-### Why we're not yet faster than CPU
+Klein bottles and Möbius bands start from random joint positions. Direct settling with target ideal lengths causes violent forces. The approach system interpolates ideal lengths from actual → target over 20 steps of 2000 iterations each. This settled reliably in ~1-2 seconds wall time.
 
-At the current settings, both engines cover ~20ms of sim time per frame at 60fps. The GPU parallelizes force computation across joints/intervals, but:
+### Surface character as a shader concern
 
-1. At freq ≤ 10 (~6000 joints), the per-dispatch work is small — GPU cores are underutilized
-2. At freq ≥ 15 (~13,500 joints), we start hitting the elastic stability limit
-3. The dispatch overhead prevents us from doing enough iterations for stiffer cables
+The four surface characters from tensegrity-lab (plus Absent) mapped directly to a switch statement in the ground_collision shader. No CPU-side abstraction needed — just a u32 in the params uniform.
 
-The GPU advantage would kick in when we can do 333+ iterations/frame over 10,000+ joints. We can't get there with the current 9-dispatch-per-iteration architecture.
+### Speed limit as global freeze
 
-### Stiffness vs stability vs dispatch count
+The original per-joint "nuked" flag was complex (w-component flags, recovery logic, per-joint frozen state). Replacing it with a single atomic frozen flag simplified the shader significantly and better matches the physics reality: if any joint exceeds the speed limit, the simulation state is compromised and should halt entirely.
 
-The elastic cable stability limit is `dt < 2/sqrt(k/m)`. Current numbers:
+## Path Forward
 
-| K at 1m | ω (1m cable, 5kg) | dt_max | Required iter/frame | Dispatches/frame |
-|---------|-------------------|--------|--------------------|--------------------|
-| 5×10⁶ | 1,000 rad/s | 2.0 ms | 10 | 90 |
-| 5×10⁷ | 3,162 | 0.63 ms | 32 | 288 |
-| 5×10⁸ | 10,000 | 0.20 ms | 100 | 900 |
-| 6.7×10⁹ (Dyneema) | 36,600 | 55 µs | 364 | 3,276 |
+### Reduce passes per iteration
 
-At higher frequencies, cables are shorter so k is larger (k = K/ideal), making the stability limit tighter. The table shows values for 1m cables; at freq 14 with ~0.7m cables, multiply ω by ~1.2.
+The 8-pass SHAKE/RATTLE architecture could be reduced to 3-4 by merging joint-domain passes. The force reset is already merged into second_half_kick.
 
-### Pre-tension and settling
+### Higher stiffness
 
-Tensegrity spheres need self-stress (pre-tension) to hold shape. We set cable ideal lengths to 95% of initial placement distance, then scale initial positions inward by 0.95. This places cables near their rest length and struts slightly compressed — close to equilibrium.
+The CFL stability limit for explicit integration is dt < 2/sqrt(k/m). Supporting physical Dyneema (6.7×10⁹ N/m) requires dt ≈ 55µs and ~364 iterations/frame. This needs fewer dispatches per iteration or in-shader iteration loops.
 
-The settling phase (2000 iterations, drag=100, no gravity) lets the structure find its actual equilibrium. Without settling, the residual force imbalance causes visible oscillation during freefall and explosions at higher frequencies.
+### Float atomics
 
-### Atomic force accumulation
+Replace i32 atomic force accumulation with compare-and-swap float accumulation or subgroup reductions. Eliminates quantization error and overflow risk.
 
-Forces are accumulated using `atomicAdd` on `i32` with a scale factor (FORCE_SCALE = 100). Multiple cables write to the same joint. This works but introduces quantization error and risks i32 overflow at high stiffness. With K = 6.7×10⁹, max force per cable at 5% strain ≈ 3.4×10⁸ N — even FORCE_SCALE = 1 risks overflow with multiple cables per joint.
+### More shapes
 
-### Surface behavior
-
-Only basic **bouncy** ground collision is implemented (reflect vy with restitution). tensegrity-lab has four modes: Frozen (stick to ground), Sticky (friction), Bouncy, Slippery (frictionless). These are straightforward to add as a per-joint GPU pass.
-
-## Path to Outperforming CPU
-
-### Priority 1: Reduce passes per iteration
-
-The 9-pass architecture is the bottleneck. Key merges:
-
-**Merge half_kick + drift + SHAKE into one pass** (joint-domain). Each joint does its own kick and drift, then each rigid interval corrects positions. Since rigid constraints are independent in tensegrity, this can be two dispatches instead of three — or even one if we give each joint knowledge of its one connected strut.
-
-**Merge reset_forces + elastic_forces + rigid_mass**. Currently three passes. If each elastic interval atomically accumulates forces AND each rigid interval accumulates mass in a single dispatch, we save two passes. The reset can be folded into the second_half_kick (read force, then zero it).
-
-**Target: 3–4 dispatches per iteration** instead of 9. This alone would allow ~200 iterations/frame, enough for K ≈ 5×10⁸.
-
-### Priority 2: In-shader iteration loop
-
-The vision doc's original suggestion: loop multiple iterations within a single dispatch, using storage buffer flushes between iterations. This requires careful ordering but could reduce dispatch count by 10-50×. The challenge is global synchronization between passes — `workgroupBarrier()` only syncs within a workgroup.
-
-One approach: split into just 2 mega-dispatches per iteration (joint-pass and interval-pass), with the iteration loop on the CPU side but only 2 dispatches per iteration instead of 9.
-
-### Priority 3: Float atomics for force accumulation
-
-Replace the i32 atomic hack with proper float accumulation. Options:
-- `atomicCompareExchangeWeak` loop on reinterpreted f32 (standard GPU trick)
-- Separate force buffers per interval, then a reduction pass
-- Use subgroup operations for partial reduction before atomic write
-
-This eliminates the FORCE_SCALE quantization error and the i32 overflow risk, enabling arbitrarily stiff cables.
-
-### Priority 4: Adaptive iteration count
-
-Instead of fixed iterations/frame, compute iterations based on current maximum strain energy or velocity. Calm structures need fewer iterations; high-energy bounces need more. This lets us use stiffer cables for most of the simulation and only burn extra iterations during impact.
-
-### Priority 5: What "remarkably better" looks like
-
-tensegrity-lab on CPU: ~500 joints at interactive rates, single-threaded, 333 iterations/frame.
-
-Chopstix target: **10,000+ joints at interactive rates** with stiffer cables and rigid struts. This means:
-- Freq 15–20 spheres running smoothly (13,500–24,000 joints)
-- Cable stiffness ≥ 10⁸ N/m (20× current, approaching physical realism)
-- Real-time at 60fps
-
-The GPU parallelism wins when per-dispatch work is large (many joints) AND dispatch count is low (merged passes). Both conditions must hold simultaneously.
+tensegrity-lab has a full DSL (Tenscript) for constructing arbitrary tensegrity fabrics. Porting the algorithmic shapes (sphere, Klein, Möbius) was straightforward; a GPU-compatible fabric builder could enable custom constructions.
 
 ## Codebase Map
 
 | File | Purpose |
 |------|---------|
-| `src/main.rs` | CLI entry point, frequency argument |
-| `src/app.rs` | Window, event loop, frame dispatch |
-| `src/constants.rs` | All physics constants in one place |
-| `src/tensegrity.rs` | Geodesic sphere → tensegrity topology generation |
+| `src/main.rs` | Entry point, ShapeConfig enum |
+| `src/app.rs` | Window, event loop, shape/surface/slider handling |
+| `src/constants.rs` | All physics constants |
+| `src/tensegrity.rs` | Geodesic sphere topology generation, TensegritySphereBuffers |
 | `src/sphere.rs` | Icosahedron subdivision (geodesic scaffold) |
+| `src/klein.rs` | Klein bottle topology generator |
+| `src/mobius.rs` | Möbius band topology generator |
+| `src/twitcher.rs` | Muscle animation — traveling sine wave contraction |
 | `src/camera.rs` | Orbit camera with mouse controls |
 | `src/gpu/mod.rs` | wgpu device/surface initialization |
-| `src/gpu/physics.rs` | Compute pipeline setup, dispatch, settle, readback |
+| `src/gpu/physics.rs` | Compute pipeline setup, dispatch modes, settle, readback |
 | `src/gpu/physics.wgsl` | All compute shader entry points |
-| `src/gpu/renderer.rs` | Cylinder instance rendering |
+| `src/gpu/renderer.rs` | Cylinder instance rendering, triangular ground grid |
 | `src/gpu/render.wgsl` | Vertex/fragment shaders |
+| `src/gpu/hud.rs` | Text-based HUD with shape bars, sliders, surface buttons |
 | `src/lib.rs` | Library facade for test access |
-| `tests/frequency_stress.rs` | Headless frequency sweep test |
+| `tests/frequency_stress.rs` | Headless sphere frequency sweep |
+| `tests/klein_stress.rs` | Headless Klein bottle stress test |
 
 ## Heritage from tensegrity-lab
 
-Concepts carried over: geodesic subdivision, tensegrity topology (push/pull intervals), pre-tension, settling, speed limit, struct-of-arrays data layout, surface interaction model.
+Ported: geodesic sphere generation, Klein bottle generator, Möbius band generator with muscle twitching animation, surface character physics (Absent/Frozen/Sticky/Bouncy/Slippery), pre-tension model, settling, speed limit concept.
 
-Concepts changed: push intervals are now truly rigid (SHAKE/RATTLE) instead of stiff springs. Physics runs on GPU compute shaders instead of CPU Verlet loop. Rendering uses GPU instance drawing from the same device.
+Changed: push intervals use SHAKE/RATTLE (rigid) for spheres, spring-push for shared-joint topologies. Physics runs on GPU compute shaders. Speed limit triggers global freeze. Elastic ideal lengths updatable at runtime via `queue.write_buffer` for muscle animation without pipeline rebuild.
 
-Not yet ported: Tenscript DSL, evolution framework, fabric plan executor, CSV export, multiple surface characters (Frozen/Sticky/Slippery), scaffold forces, pretensing by strut extension.
+Not yet ported: Tenscript DSL, evolution framework, fabric plan executor, CSV export, faces/radials, scaffold forces, pretensing by strut extension, dual chirality Möbius bands.

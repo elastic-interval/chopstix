@@ -10,13 +10,16 @@ use winit::window::{Window, WindowAttributes, WindowId};
 use crate::camera::Camera;
 use crate::constants::*;
 use crate::gpu::hud::{Hud, FREQ_CHOICES, FREQ_BUTTON_WIDTH, FREQ_BAR_HEIGHT, FREQ_BAR_TOP,
-    KLEIN_GRID, KLEIN_GRID_COLS, KLEIN_GRID_ROWS, KLEIN_BUTTON_WIDTH, KLEIN_ROW_HEIGHT,
-    KLEIN_GRID_TOP};
-use crate::gpu::physics::{PhysicsCompute, PhysicsConfig};
+    KLEIN_CHOICES, KLEIN_COLS, KLEIN_BUTTON_WIDTH, KLEIN_ROW_HEIGHT, KLEIN_GRID_TOP,
+    MOBIUS_CHOICES, MOBIUS_BUTTON_WIDTH, MOBIUS_ROW_HEIGHT, MOBIUS_BAR_TOP,
+    SURFACE_BUTTON_WIDTH, SURFACE_BAR_TOP, SURFACE_BAR_HEIGHT};
+use crate::gpu::physics::{PhysicsCompute, PhysicsConfig, SURFACE_NAMES};
 use crate::gpu::renderer::Renderer;
 use crate::gpu::Gpu;
 use crate::tensegrity::{self, TensegritySphereBuffers};
 use crate::klein;
+use crate::mobius;
+use crate::twitcher::Twitcher;
 use crate::ShapeConfig;
 
 
@@ -41,9 +44,14 @@ struct AppState {
     modifiers: Modifiers,
     pull_k_at_1m: f32,
     pretension: f32,
+    surface_character: u32,
     show_hud: bool,
     /// Which slider is being dragged (0=stiffness, 1=pretension), or None
     dragging_slider: Option<usize>,
+    /// Deferred shape rebuild — counts down frames before executing (0 = not pending)
+    pending_rebuild: u32,
+    /// Muscle twitching animation (active for Möbius)
+    twitcher: Option<Twitcher>,
 }
 
 pub struct App {
@@ -67,6 +75,9 @@ impl App {
             ShapeConfig::Klein { width, height, shift } => {
                 klein::generate_klein(*width, *height, *shift, pull_k_at_1m)
             }
+            ShapeConfig::Mobius { segments } => {
+                mobius::generate_mobius(*segments, pull_k_at_1m)
+            }
         }
     }
 
@@ -74,34 +85,71 @@ impl App {
         match shape {
             ShapeConfig::Sphere { frequency } => *frequency,
             ShapeConfig::Klein { width, height, .. } => {
-                // Equivalent visual frequency from joint count.
-                // Sphere: joints ≈ 10 * freq², so freq ≈ sqrt(joints / 10).
                 let joints = width * height / 2;
+                ((joints as f32 / 10.0).sqrt() as usize).max(1)
+            }
+            ShapeConfig::Mobius { segments } => {
+                // Möbius has fewer intervals per joint than a sphere, so intervals
+                // are longer and need thinner rendering. Scale as if 3× the joints.
+                let joints = (segments * 2 + 1) * 3;
                 ((joints as f32 / 10.0).sqrt() as usize).max(1)
             }
         }
     }
 
-    /// Build a PhysicsConfig appropriate for the current shape.
-    /// Klein: no gravity, no ground. Spheres: normal gravity/ground.
-    fn physics_config(shape: &ShapeConfig, pull_k_at_1m: f32, frequency: usize) -> PhysicsConfig {
+    /// Build a PhysicsConfig appropriate for the current shape and surface.
+    fn physics_config(shape: &ShapeConfig, pull_k_at_1m: f32, frequency: usize, surface_character: u32) -> PhysicsConfig {
         let mut config = PhysicsConfig {
             pull_k_at_1m,
+            surface_character,
             ..PhysicsConfig::default()
         };
-        if matches!(shape, ShapeConfig::Klein { .. }) {
+        if matches!(shape, ShapeConfig::Klein { .. } | ShapeConfig::Mobius { .. }) {
             config.gravity = 0.0;
             config.ground_y = -1e6;
         }
         config.scaled_for_frequency(frequency)
     }
 
+    /// Whether the current shape uses approach-based settling
+    fn uses_approach(shape: &ShapeConfig) -> bool {
+        matches!(shape, ShapeConfig::Klein { .. } | ShapeConfig::Mobius { .. })
+    }
+
+    /// Create a twitcher appropriate for the shape, or None.
+    fn create_twitcher(shape: &ShapeConfig, buffers: &TensegritySphereBuffers) -> Option<Twitcher> {
+        match shape {
+            ShapeConfig::Mobius { segments } => {
+                let joint_count = segments * 2 + 1;
+                Some(Twitcher::for_mobius(buffers.elastic_ideal.clone(), joint_count))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the ground grid should be visible
+    fn show_ground(shape: &ShapeConfig, surface_character: u32) -> bool {
+        // No ground for zero-gravity shapes or absent surface
+        if matches!(shape, ShapeConfig::Klein { .. } | ShapeConfig::Mobius { .. }) {
+            return false;
+        }
+        surface_character != 0 // 0 = Absent
+    }
+
+    /// Schedule a shape rebuild — clears display immediately, defers heavy work to next frame.
+    fn schedule_rebuild(state: &mut AppState) {
+        state.pending_rebuild = 2; // render one blank frame, then rebuild on the next
+        state.paused = true;
+        // Clear the display so the old shape disappears instantly
+        state.renderer.update_instances(&state.gpu.device, &[], App::show_ground(&state.shape, state.surface_character));
+    }
+
     fn rebuild_shape(state: &mut AppState) {
-        let config = App::physics_config(&state.shape, state.pull_k_at_1m, state.frequency);
+        let config = App::physics_config(&state.shape, state.pull_k_at_1m, state.frequency, state.surface_character);
         let mut buffers = App::generate_shape(&state.shape, state.pull_k_at_1m);
 
-        // Settle: use approach-based settling for spring-push (Klein), regular for spheres
-        if buffers.use_spring_push {
+        // Settle: approach for random-start topologies, regular for spheres
+        if App::uses_approach(&state.shape) {
             buffers.positions = PhysicsCompute::settle_with_approach(
                 &state.gpu.device, &state.gpu.queue, &mut buffers, &config,
             );
@@ -122,14 +170,15 @@ impl App {
         let bounding_radius = compute_bounding_radius(&buffers.positions);
         state.camera.set_distance(bounding_radius * 2.8);
 
+        state.twitcher = App::create_twitcher(&state.shape, &buffers);
         state.buffers = buffers;
-        state.renderer.update_instances(&state.gpu.device, &state.buffers.positions);
+        state.renderer.update_instances(&state.gpu.device, &state.buffers.positions, App::show_ground(&state.shape, state.surface_character));
         update_title(state);
     }
 
     /// Update cable stiffness without resettling — keeps current positions/velocities.
     fn update_stiffness(state: &mut AppState) {
-        let config = App::physics_config(&state.shape, state.pull_k_at_1m, state.frequency);
+        let config = App::physics_config(&state.shape, state.pull_k_at_1m, state.frequency, state.surface_character);
 
         // Read back current positions from GPU
         let mut encoder = state.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -158,7 +207,7 @@ impl App {
     fn adjust_pretension(state: &mut AppState, factor: f32) {
         state.pretension = (state.pretension * factor).clamp(0.5, 1.0);
 
-        let config = App::physics_config(&state.shape, state.pull_k_at_1m, state.frequency);
+        let config = App::physics_config(&state.shape, state.pull_k_at_1m, state.frequency, state.surface_character);
 
         // Read back current positions
         let mut encoder = state.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -208,30 +257,48 @@ impl App {
         App::freq_bar_hover_index(state).map(|i| FREQ_CHOICES[i])
     }
 
-    /// Returns (row, col) of the Klein grid button the cursor is over, if any.
-    fn klein_grid_hover(state: &AppState) -> Option<(usize, usize)> {
-        let grid_left = state.hud.klein_grid_left() as f64;
+    /// Returns the Klein button index the cursor is over, if any.
+    fn klein_hover_index(state: &AppState) -> Option<usize> {
+        let bar_left = state.hud.klein_bar_left() as f64;
         let (cx, cy) = state.cursor_pos;
-        if cy < KLEIN_GRID_TOP as f64
-            || cy > (KLEIN_GRID_TOP + KLEIN_GRID_ROWS as f32 * KLEIN_ROW_HEIGHT) as f64
-        {
+        if cy < KLEIN_GRID_TOP as f64 || cy > (KLEIN_GRID_TOP + KLEIN_ROW_HEIGHT) as f64 {
             return None;
         }
-        if cx < grid_left {
-            return None;
-        }
-        let row = ((cy - KLEIN_GRID_TOP as f64) / KLEIN_ROW_HEIGHT as f64) as usize;
-        let col = ((cx - grid_left) / KLEIN_BUTTON_WIDTH as f64) as usize;
-        if row < KLEIN_GRID_ROWS && col < KLEIN_GRID_COLS {
-            Some((row, col))
-        } else {
-            None
-        }
+        if cx < bar_left { return None; }
+        let idx = ((cx - bar_left) / KLEIN_BUTTON_WIDTH as f64) as usize;
+        if idx < KLEIN_COLS { Some(idx) } else { None }
     }
 
-    /// Returns the (width, height) of the Klein grid button at cursor, if any.
-    fn klein_grid_hit(state: &AppState) -> Option<(usize, usize)> {
-        App::klein_grid_hover(state).map(|(r, c)| KLEIN_GRID[r][c])
+    fn klein_hit(state: &AppState) -> Option<(usize, usize)> {
+        App::klein_hover_index(state).map(|i| KLEIN_CHOICES[i])
+    }
+
+    /// Returns the Möbius button index the cursor is over, if any.
+    fn mobius_hover_index(state: &AppState) -> Option<usize> {
+        let bar_left = state.hud.mobius_bar_left() as f64;
+        let (cx, cy) = state.cursor_pos;
+        if cy < MOBIUS_BAR_TOP as f64 || cy > (MOBIUS_BAR_TOP + MOBIUS_ROW_HEIGHT) as f64 {
+            return None;
+        }
+        if cx < bar_left { return None; }
+        let idx = ((cx - bar_left) / MOBIUS_BUTTON_WIDTH as f64) as usize;
+        if idx < MOBIUS_CHOICES.len() { Some(idx) } else { None }
+    }
+
+    fn mobius_hit(state: &AppState) -> Option<usize> {
+        App::mobius_hover_index(state).map(|i| MOBIUS_CHOICES[i])
+    }
+
+    /// Returns the surface button index the cursor is over, if any.
+    fn surface_hover_index(state: &AppState) -> Option<usize> {
+        let bar_left = state.hud.surface_bar_left() as f64;
+        let (cx, cy) = state.cursor_pos;
+        if cy < SURFACE_BAR_TOP as f64 || cy > (SURFACE_BAR_TOP + SURFACE_BAR_HEIGHT) as f64 {
+            return None;
+        }
+        if cx < bar_left { return None; }
+        let idx = ((cx - bar_left) / SURFACE_BUTTON_WIDTH as f64) as usize;
+        if idx < 5 { Some(idx) } else { None }
     }
 
     /// Apply slider position from current cursor Y.
@@ -277,11 +344,14 @@ fn update_title(state: &AppState) {
     let shape_tag = match &state.shape {
         ShapeConfig::Sphere { frequency } => format!("sphere freq={}", frequency),
         ShapeConfig::Klein { width, height, .. } => format!("klein {}x{}", width, height),
+        ShapeConfig::Mobius { segments } => format!("mobius seg={}", segments),
     };
+    let surface_tag = SURFACE_NAMES[state.surface_character as usize];
     let num_struts = state.buffers.num_rigid() + state.buffers.num_push();
     state.window.set_title(&format!(
-        "Chopstix | {} | joints={} | struts={} | cables={} | K={:.0e} | {:.0} FPS",
+        "Chopstix | {} | {} | joints={} | struts={} | cables={} | K={:.0e} | {:.0} FPS",
         shape_tag,
+        surface_tag,
         state.buffers.num_joints(),
         num_struts,
         state.buffers.num_elastic(),
@@ -308,11 +378,15 @@ impl ApplicationHandler for App {
 
         let gpu = Gpu::new(window.clone());
         let frequency = App::frequency_for_shape(&self.shape);
-        let config = App::physics_config(&self.shape, PULL_K_AT_1M, frequency);
+        let initial_surface = match &self.shape {
+            ShapeConfig::Sphere { .. } => 1, // Bouncy
+            _ => 0, // Absent
+        };
+        let config = App::physics_config(&self.shape, PULL_K_AT_1M, frequency, initial_surface);
         let mut buffers = App::generate_shape(&self.shape, PULL_K_AT_1M);
 
         // Settle
-        if buffers.use_spring_push {
+        if App::uses_approach(&self.shape) {
             buffers.positions = PhysicsCompute::settle_with_approach(
                 &gpu.device, &gpu.queue, &mut buffers, &config,
             );
@@ -345,7 +419,7 @@ impl ApplicationHandler for App {
             shape: self.shape.clone(),
             frequency,
             iterations,
-            paused: true,
+            paused: false,
             last_frame: Instant::now(),
             frame_count: 0,
             fps_timer: Instant::now(),
@@ -355,10 +429,13 @@ impl ApplicationHandler for App {
             modifiers: Modifiers::default(),
             pull_k_at_1m: PULL_K_AT_1M,
             pretension: 0.95,
+            surface_character: initial_surface,
             show_hud: true,
             dragging_slider: None,
+            pending_rebuild: 0,
+            twitcher: None,
         };
-        state.renderer.update_instances(&state.gpu.device, &state.buffers.positions);
+        state.renderer.update_instances(&state.gpu.device, &state.buffers.positions, App::show_ground(&state.shape, state.surface_character));
         log::info!("Initial instances populated, {} positions", state.buffers.positions.len());
         if let Some(pos) = state.buffers.positions.first() {
             log::info!("First joint position: [{:.2}, {:.2}, {:.2}]", pos[0], pos[1], pos[2]);
@@ -400,6 +477,10 @@ impl ApplicationHandler for App {
                     Key::Character(c) if c.as_str() == "h" => {
                         state.show_hud = !state.show_hud;
                     }
+                    Key::Named(NamedKey::Enter) => {
+                        // Regenerate current shape (new random seed for Klein/Möbius)
+                        App::schedule_rebuild(state);
+                    }
                     _ => {}
                 }
             }
@@ -415,17 +496,36 @@ impl ApplicationHandler for App {
                         if !already {
                             state.shape = ShapeConfig::Sphere { frequency: freq };
                             state.frequency = App::frequency_for_shape(&state.shape);
-                            App::rebuild_shape(state);
+                            App::schedule_rebuild(state);
                             return;
                         }
                     }
                     // Klein grid — click always switches to klein
-                    if let Some((w, h)) = App::klein_grid_hit(state) {
+                    if let Some((w, h)) = App::klein_hit(state) {
                         let already = matches!(state.shape, ShapeConfig::Klein { width, height, .. } if width == w && height == h);
                         if !already {
                             state.shape = ShapeConfig::Klein { width: w, height: h, shift: 0 };
                             state.frequency = App::frequency_for_shape(&state.shape);
-                            App::rebuild_shape(state);
+                            App::schedule_rebuild(state);
+                            return;
+                        }
+                    }
+                    // Möbius bar — click always switches to möbius
+                    if let Some(seg) = App::mobius_hit(state) {
+                        let already = matches!(state.shape, ShapeConfig::Mobius { segments } if segments == seg);
+                        if !already {
+                            state.shape = ShapeConfig::Mobius { segments: seg };
+                            state.frequency = App::frequency_for_shape(&state.shape);
+                            App::schedule_rebuild(state);
+                            return;
+                        }
+                    }
+                    // Surface character bar
+                    if let Some(idx) = App::surface_hover_index(state) {
+                        let new_char = idx as u32;
+                        if new_char != state.surface_character {
+                            state.surface_character = new_char;
+                            App::update_stiffness(state); // rebuilds physics with new surface
                             return;
                         }
                     }
@@ -476,6 +576,15 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // Execute deferred rebuild: count down frames, rebuild when it hits 1
+                if state.pending_rebuild > 0 {
+                    state.pending_rebuild -= 1;
+                    if state.pending_rebuild == 0 {
+                        App::rebuild_shape(state);
+                        state.paused = false;
+                    }
+                }
+
                 // FPS tracking
                 state.frame_count += 1;
                 let fps_elapsed = state.fps_timer.elapsed().as_secs_f32();
@@ -489,7 +598,7 @@ impl ApplicationHandler for App {
 
                 // Update HUD
                 if state.show_hud {
-                    let config = App::physics_config(&state.shape, state.pull_k_at_1m, state.frequency);
+                    let config = App::physics_config(&state.shape, state.pull_k_at_1m, state.frequency, state.surface_character);
                     let paused_tag = if state.paused { "  PAUSED" } else { "" };
 
                     // Title
@@ -505,12 +614,32 @@ impl ApplicationHandler for App {
                     let hover_idx = App::freq_bar_hover_index(state);
                     state.hud.set_freq_bar(sphere_freq, hover_idx);
 
+                    // Centered shape description
+                    let shape_title = match &state.shape {
+                        ShapeConfig::Sphere { frequency } => format!("Geodesic Sphere  freq {}", frequency),
+                        ShapeConfig::Klein { width, height, .. } => format!("Klein Bottle  {}x{}", width, height),
+                        ShapeConfig::Mobius { segments } => format!("Mobius Band  {} segments", segments),
+                    };
+                    state.hud.set_shape_title(&shape_title);
+
                     let (klein_w, klein_h) = match &state.shape {
                         ShapeConfig::Klein { width, height, .. } => (*width, *height),
                         _ => (0, 0), // nothing highlighted
                     };
-                    let klein_hover = App::klein_grid_hover(state);
-                    state.hud.set_klein_grid(klein_w, klein_h, klein_hover);
+                    let klein_hover = App::klein_hover_index(state);
+                    state.hud.set_klein_bar(klein_w, klein_h, klein_hover);
+
+                    // Möbius bar
+                    let mobius_seg = match &state.shape {
+                        ShapeConfig::Mobius { segments } => *segments,
+                        _ => 0,
+                    };
+                    let mobius_hover = App::mobius_hover_index(state);
+                    state.hud.set_mobius_bar(mobius_seg, mobius_hover);
+
+                    // Surface character bar
+                    let surface_hover = App::surface_hover_index(state);
+                    state.hud.set_surface_bar(state.surface_character, surface_hover);
 
                     // Legend
                     state.hud.set_legend(&[
@@ -543,6 +672,14 @@ impl ApplicationHandler for App {
 
                 // Physics
                 if !state.paused {
+                    // Update muscle twitching before physics dispatch
+                    if let Some(ref mut twitcher) = state.twitcher {
+                        if twitcher.tick() {
+                            let (ideals, ks) = twitcher.current_ideals(state.pull_k_at_1m);
+                            state.physics.write_elastic_ideals(&state.gpu.queue, &ideals, &ks);
+                        }
+                    }
+
                     let mut encoder = state.gpu.device.create_command_encoder(
                         &wgpu::CommandEncoderDescriptor {
                             label: Some("Physics Encoder"),
@@ -559,7 +696,13 @@ impl ApplicationHandler for App {
 
                     if do_readback {
                         let positions = state.physics.read_positions(&state.gpu.device);
-                        state.renderer.update_instances(&state.gpu.device, &positions);
+                        state.renderer.update_instances(&state.gpu.device, &positions, App::show_ground(&state.shape, state.surface_character));
+
+                        // Check if physics violated the speed limit
+                        if state.physics.read_frozen(&state.gpu.device) {
+                            state.paused = true;
+                            log::warn!("Speed limit exceeded — simulation frozen");
+                        }
 
                         // Track centroid with gentle drift
                         if !positions.is_empty() {
