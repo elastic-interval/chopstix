@@ -11,14 +11,14 @@ mod twitcher;
 
 use winit::event_loop::EventLoop;
 
-use build::executor::BuildNode;
+use build::fabric_library::FabricName;
 
 #[derive(Clone, Debug)]
 pub enum ShapeConfig {
     Sphere { frequency: usize },
     Klein { width: usize, height: usize, shift: usize },
     Mobius { segments: usize },
-    Tenscript { program: BuildNode },
+    Tenscript { fabric: FabricName },
 }
 
 fn main() {
@@ -26,6 +26,6 @@ fn main() {
     log::info!("Starting chopstix");
 
     let event_loop = EventLoop::new().expect("Failed to create event loop");
-    let mut app = app::App::new(ShapeConfig::Sphere { frequency: 3 });
+    let mut app = app::App::new(ShapeConfig::Tenscript { fabric: FabricName::OpenClaw });
     event_loop.run_app(&mut app).expect("Event loop error");
 }

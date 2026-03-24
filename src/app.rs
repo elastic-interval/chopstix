@@ -7,8 +7,8 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-use crate::build::executor::{BuildExecutor, BuildNode};
-use crate::build::Spin;
+use crate::build::executor::BuildExecutor;
+use crate::build::fabric_library::{FabricName, ALL_FABRICS};
 use crate::camera::Camera;
 use crate::constants::*;
 use crate::gpu::growable::GrowablePhysics;
@@ -16,7 +16,7 @@ use crate::gpu::hud::{Hud, FREQ_CHOICES, FREQ_BUTTON_WIDTH, FREQ_BAR_HEIGHT, FRE
     KLEIN_CHOICES, KLEIN_COLS, KLEIN_BUTTON_WIDTH, KLEIN_ROW_HEIGHT, KLEIN_GRID_TOP,
     MOBIUS_CHOICES, MOBIUS_BUTTON_WIDTH, MOBIUS_ROW_HEIGHT, MOBIUS_BAR_TOP,
     SURFACE_BUTTON_WIDTH, SURFACE_BAR_TOP, SURFACE_BAR_HEIGHT,
-    BUILD_CHOICES, BUILD_BUTTON_WIDTH, BUILD_ROW_HEIGHT, BUILD_BAR_TOP};
+    BUILD_BUTTON_WIDTH, BUILD_ROW_HEIGHT, BUILD_BAR_TOP, build_labels};
 use crate::gpu::physics::{PhysicsCompute, PhysicsConfig, SURFACE_NAMES};
 use crate::gpu::renderer::Renderer;
 use crate::gpu::Gpu;
@@ -221,7 +221,7 @@ impl App {
 
     fn rebuild_tenscript(state: &mut AppState) {
         let program = match &state.shape {
-            ShapeConfig::Tenscript { program } => program.clone(),
+            ShapeConfig::Tenscript { fabric } => fabric.program(),
             _ => return,
         };
 
@@ -234,8 +234,6 @@ impl App {
             &state.gpu.queue,
             program,
             state.pull_k_at_1m,
-            2.0,  // face_radius
-            7.0,  // brick_height
         );
 
         // Set up renderer with empty topology (will be populated as bricks are placed)
@@ -276,11 +274,17 @@ impl App {
         }
         if cx < bar_left { return None; }
         let idx = ((cx - bar_left) / BUILD_BUTTON_WIDTH as f64) as usize;
-        if idx < BUILD_CHOICES.len() { Some(idx) } else { None }
+        let labels = build_labels();
+        if idx < labels.len() { Some(idx) } else { None }
     }
 
-    fn build_hit(state: &AppState) -> Option<usize> {
-        App::build_hover_index(state).map(|i| BUILD_CHOICES[i].1)
+    fn build_hit(state: &AppState) -> Option<&'static str> {
+        let labels = build_labels();
+        App::build_hover_index(state).and_then(|i| labels.get(i).copied())
+    }
+
+    fn build_label_to_fabric(label: &str) -> Option<FabricName> {
+        ALL_FABRICS.iter().find(|f| f.label() == label).copied()
     }
 
     /// Update cable stiffness without resettling — keeps current positions/velocities.
@@ -460,11 +464,11 @@ fn update_title(state: &AppState) {
         ShapeConfig::Sphere { frequency } => format!("sphere freq={}", frequency),
         ShapeConfig::Klein { width, height, .. } => format!("klein {}x{}", width, height),
         ShapeConfig::Mobius { segments } => format!("mobius seg={}", segments),
-        ShapeConfig::Tenscript { .. } => {
+        ShapeConfig::Tenscript { fabric } => {
             if let Some(ref builder) = state.builder {
-                format!("tenscript [{}]", builder.stage_name())
+                format!("{} [{}]", fabric.label(), builder.stage_name())
             } else {
-                "tenscript".to_string()
+                fabric.label().to_string()
             }
         }
     };
@@ -667,13 +671,13 @@ impl ApplicationHandler for App {
                         }
                     }
                     // Build preset bar
-                    if let Some(count) = App::build_hit(state) {
-                        state.shape = ShapeConfig::Tenscript {
-                            program: BuildNode::Column { count, spin: Spin::Left },
-                        };
-                        state.frequency = App::frequency_for_shape(&state.shape);
-                        App::schedule_rebuild(state);
-                        return;
+                    if let Some(label) = App::build_hit(state) {
+                        if let Some(fabric) = App::build_label_to_fabric(label) {
+                            state.shape = ShapeConfig::Tenscript { fabric };
+                            state.frequency = App::frequency_for_shape(&state.shape);
+                            App::schedule_rebuild(state);
+                            return;
+                        }
                     }
                     if let Some(col) = state.hud.slider_hit(state.cursor_pos.0) {
                         state.dragging_slider = Some(col);
@@ -765,11 +769,11 @@ impl ApplicationHandler for App {
                         ShapeConfig::Sphere { frequency } => format!("Geodesic Sphere  freq {}", frequency),
                         ShapeConfig::Klein { width, height, .. } => format!("Klein Bottle  {}x{}", width, height),
                         ShapeConfig::Mobius { segments } => format!("Mobius Band  {} segments", segments),
-                        ShapeConfig::Tenscript { .. } => {
+                        ShapeConfig::Tenscript { fabric } => {
                             if let Some(ref builder) = state.builder {
-                                format!("Tenscript Build  [{}]", builder.stage_name())
+                                format!("{}  [{}]", fabric.label(), builder.stage_name())
                             } else {
-                                "Tenscript Build".to_string()
+                                fabric.label().to_string()
                             }
                         }
                     };
@@ -796,11 +800,11 @@ impl ApplicationHandler for App {
 
                     // Build preset bar
                     let build_hover = App::build_hover_index(state);
-                    let active_build = match &state.shape {
-                        ShapeConfig::Tenscript { program: BuildNode::Column { count, .. } } => Some(*count),
+                    let active_label = match &state.shape {
+                        ShapeConfig::Tenscript { fabric } => Some(fabric.label()),
                         _ => None,
                     };
-                    state.hud.set_build_bar(active_build, build_hover);
+                    state.hud.set_build_bar(active_label, build_hover);
 
                     // Legend
                     state.hud.set_legend(&[

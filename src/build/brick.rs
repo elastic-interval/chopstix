@@ -1,5 +1,4 @@
 use glam::Vec3;
-use std::f32::consts::PI;
 
 use super::Spin;
 
@@ -8,6 +7,8 @@ pub struct BrickFace {
     pub spin: Spin,
     pub is_attach: bool,
     pub is_forward: bool,
+    /// Optional name for face lookup (used by hub bricks like Omni)
+    pub name: Option<&'static str>,
 }
 
 pub struct BrickTemplate {
@@ -20,17 +21,204 @@ pub struct BrickTemplate {
 }
 
 impl BrickTemplate {
-    /// Create a single-twist-left brick.
+    /// SingleTwistLeft using tensegrity-lab's baked equilibrium coordinates.
     ///
-    /// 6 joints forming two triangles connected by 3 push struts (twisted left)
-    /// and 3 pull cables (helical).
+    /// Joint order: AlphaX(0), OmegaX(1), AlphaY(2), OmegaY(3), AlphaZ(4), OmegaZ(5)
+    /// Bottom face (attach): [0, 2, 4] = [AlphaX, AlphaY, AlphaZ] - Left spin
+    /// Top face (forward):   [5, 3, 1] = [OmegaZ, OmegaY, OmegaX] - Left spin
     ///
-    /// Bottom face (attach): joints 0, 1, 2
-    /// Top face (forward):   joints 3, 4, 5
-    pub fn single_twist_left(face_radius: f32, height: f32) -> Self {
-        let twist = PI / 6.0; // 30 degree twist
+    /// Push struts: AlphaX-OmegaX, AlphaY-OmegaY, AlphaZ-OmegaZ
+    /// Pull cables: AlphaX-OmegaY, AlphaY-OmegaZ, AlphaZ-OmegaX
+    pub fn single_twist_left_baked() -> Self {
+        let joints = vec![
+            Vec3::new(-1.10019, -0.96247, 0.00000), // 0: AlphaX
+            Vec3::new(0.95280, 0.96246, -0.55010),   // 1: OmegaX
+            Vec3::new(0.55011, -0.96245, 0.95280),   // 2: AlphaY
+            Vec3::new(-0.95281, 0.96245, -0.55010),   // 3: OmegaY
+            Vec3::new(0.55011, -0.96246, -0.95280),   // 4: AlphaZ
+            Vec3::new(-0.00001, 0.96246, 1.10020),    // 5: OmegaZ
+        ];
 
-        // Bottom triangle (z = 0)
+        let pushes = vec![
+            (0, 1, dist(&joints, 0, 1)), // AlphaX → OmegaX
+            (2, 3, dist(&joints, 2, 3)), // AlphaY → OmegaY
+            (4, 5, dist(&joints, 4, 5)), // AlphaZ → OmegaZ
+        ];
+
+        let pulls = vec![
+            (0, 3, dist(&joints, 0, 3)), // AlphaX → OmegaY
+            (2, 5, dist(&joints, 2, 5)), // AlphaY → OmegaZ
+            (4, 1, dist(&joints, 4, 1)), // AlphaZ → OmegaX
+        ];
+
+        let faces = vec![
+            BrickFace {
+                corners: [0, 2, 4], // AlphaX, AlphaY, AlphaZ
+                spin: Spin::Left,
+                is_attach: true,
+                is_forward: false,
+                name: None,
+            },
+            BrickFace {
+                corners: [5, 3, 1], // OmegaZ, OmegaY, OmegaX
+                spin: Spin::Left,
+                is_attach: false,
+                is_forward: true,
+                name: None,
+            },
+        ];
+
+        Self { joints, pushes, pulls, faces }
+    }
+
+    /// SingleTwistRight: mirror of left.
+    pub fn single_twist_right_baked() -> Self {
+        let mut template = Self::single_twist_left_baked();
+
+        // Mirror X coordinates
+        for joint in &mut template.joints {
+            joint.x = -joint.x;
+        }
+
+        // Recompute lengths
+        for push in &mut template.pushes {
+            push.2 = (template.joints[push.0] - template.joints[push.1]).length();
+        }
+        for pull in &mut template.pulls {
+            pull.2 = (template.joints[pull.0] - template.joints[pull.1]).length();
+        }
+
+        // Flip spins and reverse winding
+        for face in &mut template.faces {
+            face.spin = face.spin.opposite();
+            face.corners.swap(1, 2);
+        }
+
+        template
+    }
+
+    /// Get SingleTwist template for a given spin (baked coordinates).
+    /// No pre-orientation — placement_transform handles alignment.
+    pub fn for_spin_baked(spin: Spin) -> Self {
+        match spin {
+            Spin::Left => Self::single_twist_left_baked(),
+            Spin::Right => Self::single_twist_right_baked(),
+        }
+    }
+
+    /// OmniSymmetrical brick using tensegrity-lab's baked equilibrium coordinates.
+    ///
+    /// 12 joints, 6 push struts (2 per axis), 0 pull cables, 8 faces.
+    /// This is the hub brick for the Open Claw and other branching structures.
+    ///
+    /// Joint order (following push definition order):
+    ///   X pushes: 0=BotAlphaX, 1=BotOmegaX, 2=TopAlphaX, 3=TopOmegaX
+    ///   Y pushes: 4=BotAlphaY, 5=BotOmegaY, 6=TopAlphaY, 7=TopOmegaY
+    ///   Z pushes: 8=BotAlphaZ, 9=BotOmegaZ, 10=TopAlphaZ, 11=TopOmegaZ
+    pub fn omni_symmetrical() -> Self {
+        let joints = vec![
+            Vec3::new(-1.55675,  0.00000, -0.77838), //  0: BotAlphaX
+            Vec3::new( 1.55675,  0.00000, -0.77838), //  1: BotOmegaX
+            Vec3::new(-1.55675,  0.00000,  0.77838), //  2: TopAlphaX
+            Vec3::new( 1.55675,  0.00000,  0.77838), //  3: TopOmegaX
+            Vec3::new(-0.77838, -1.55675,  0.00000), //  4: BotAlphaY
+            Vec3::new(-0.77838,  1.55675,  0.00000), //  5: BotOmegaY
+            Vec3::new( 0.77838, -1.55675,  0.00000), //  6: TopAlphaY
+            Vec3::new( 0.77838,  1.55675,  0.00000), //  7: TopOmegaY
+            Vec3::new( 0.00000, -0.77838, -1.55675), //  8: BotAlphaZ
+            Vec3::new( 0.00000, -0.77838,  1.55675), //  9: BotOmegaZ
+            Vec3::new( 0.00000,  0.77839, -1.55675), // 10: TopAlphaZ
+            Vec3::new( 0.00000,  0.77839,  1.55675), // 11: TopOmegaZ
+        ];
+
+        let pushes = vec![
+            (0, 1, dist(&joints, 0, 1)),   // BotAlphaX → BotOmegaX
+            (2, 3, dist(&joints, 2, 3)),   // TopAlphaX → TopOmegaX
+            (4, 5, dist(&joints, 4, 5)),   // BotAlphaY → BotOmegaY
+            (6, 7, dist(&joints, 6, 7)),   // TopAlphaY → TopOmegaY
+            (8, 9, dist(&joints, 8, 9)),   // BotAlphaZ → BotOmegaZ
+            (10, 11, dist(&joints, 10, 11)), // TopAlphaZ → TopOmegaZ
+        ];
+
+        // Omni brick has no pull cables — all connectivity comes from face joins
+        let pulls = vec![];
+
+        // 8 faces matching tensegrity-lab's Seed(1) role aliases
+        let faces = vec![
+            // Face 0: OmniTop [TopOmegaX, TopOmegaY, TopOmegaZ] - Right
+            BrickFace {
+                corners: [3, 7, 11],
+                spin: Spin::Right,
+                is_attach: false,
+                is_forward: false,
+                name: Some("OmniTop"),
+            },
+            // Face 1: OmniTopX [TopOmegaX, TopAlphaY, BotOmegaZ] - Left
+            BrickFace {
+                corners: [3, 6, 9],
+                spin: Spin::Left,
+                is_attach: false,
+                is_forward: false,
+                name: Some("OmniTopX"),
+            },
+            // Face 2: OmniTopY [TopOmegaY, TopAlphaZ, BotOmegaX] - Left
+            BrickFace {
+                corners: [7, 10, 1],
+                spin: Spin::Left,
+                is_attach: false,
+                is_forward: false,
+                name: Some("OmniTopY"),
+            },
+            // Face 3: OmniTopZ [TopOmegaZ, TopAlphaX, BotOmegaY] - Left
+            BrickFace {
+                corners: [11, 2, 5],
+                spin: Spin::Left,
+                is_attach: false,
+                is_forward: false,
+                name: Some("OmniTopZ"),
+            },
+            // Face 4: OmniBotZ [BotAlphaZ, BotOmegaX, TopAlphaY] - Right
+            BrickFace {
+                corners: [8, 1, 6],
+                spin: Spin::Right,
+                is_attach: false,
+                is_forward: true,
+                name: Some("OmniBotZ"),
+            },
+            // Face 5: OmniBotY [BotAlphaY, BotOmegaZ, TopAlphaX] - Right
+            BrickFace {
+                corners: [4, 9, 2],
+                spin: Spin::Right,
+                is_attach: false,
+                is_forward: true,
+                name: Some("OmniBotY"),
+            },
+            // Face 6: OmniBotX [BotAlphaX, BotOmegaY, TopAlphaZ] - Right
+            BrickFace {
+                corners: [0, 5, 10],
+                spin: Spin::Right,
+                is_attach: false,
+                is_forward: true,
+                name: Some("OmniBotX"),
+            },
+            // Face 7: OmniBot [BotAlphaX, BotAlphaY, BotAlphaZ] - Left (open)
+            BrickFace {
+                corners: [0, 4, 8],
+                spin: Spin::Left,
+                is_attach: false,
+                is_forward: false,
+                name: Some("OmniBot"),
+            },
+        ];
+
+        Self { joints, pushes, pulls, faces }
+    }
+
+    /// Parametric single-twist-left (original implementation).
+    pub fn single_twist_left(face_radius: f32, height: f32) -> Self {
+        use std::f32::consts::PI;
+        let twist = PI / 6.0;
+
         let j0 = Vec3::new(face_radius, 0.0, 0.0);
         let j1 = Vec3::new(
             face_radius * (2.0 * PI / 3.0).cos(),
@@ -42,13 +230,7 @@ impl BrickTemplate {
             face_radius * (4.0 * PI / 3.0).sin(),
             0.0,
         );
-
-        // Top triangle (z = height), rotated by twist
-        let j3 = Vec3::new(
-            face_radius * twist.cos(),
-            face_radius * twist.sin(),
-            height,
-        );
+        let j3 = Vec3::new(face_radius * twist.cos(), face_radius * twist.sin(), height);
         let j4 = Vec3::new(
             face_radius * (twist + 2.0 * PI / 3.0).cos(),
             face_radius * (twist + 2.0 * PI / 3.0).sin(),
@@ -61,76 +243,89 @@ impl BrickTemplate {
         );
 
         let joints = vec![j0, j1, j2, j3, j4, j5];
-
-        // Push struts: left twist means bottom[i] -> top[(i+2)%3]
         let pushes = vec![
-            (0, 5, (j0 - j5).length()), // j0 -> j5
-            (1, 3, (j1 - j3).length()), // j1 -> j3
-            (2, 4, (j2 - j4).length()), // j2 -> j4
+            (0, 5, (j0 - j5).length()),
+            (1, 3, (j1 - j3).length()),
+            (2, 4, (j2 - j4).length()),
         ];
-
-        // Pull cables: helical, bottom[i] -> top[i]
         let pulls = vec![
-            (0, 3, (j0 - j3).length()), // j0 -> j3
-            (1, 4, (j1 - j4).length()), // j1 -> j4
-            (2, 5, (j2 - j5).length()), // j2 -> j5
+            (0, 3, (j0 - j3).length()),
+            (1, 4, (j1 - j4).length()),
+            (2, 5, (j2 - j5).length()),
         ];
-
         let faces = vec![
-            BrickFace {
-                corners: [0, 1, 2],
-                spin: Spin::Left,
-                is_attach: true,
-                is_forward: false,
-            },
-            BrickFace {
-                corners: [3, 4, 5],
-                spin: Spin::Right,
-                is_attach: false,
-                is_forward: true,
-            },
+            BrickFace { corners: [0, 1, 2], spin: Spin::Left, is_attach: true, is_forward: false, name: None },
+            BrickFace { corners: [3, 4, 5], spin: Spin::Right, is_attach: false, is_forward: true, name: None },
         ];
-
-        Self {
-            joints,
-            pushes,
-            pulls,
-            faces,
-        }
+        Self { joints, pushes, pulls, faces }
     }
 
-    /// Create a single-twist-right brick by mirroring X coordinates.
     pub fn single_twist_right(face_radius: f32, height: f32) -> Self {
         let mut template = Self::single_twist_left(face_radius, height);
-
-        // Mirror X coordinates
-        for joint in &mut template.joints {
-            joint.x = -joint.x;
-        }
-
-        // Recompute lengths (mirroring preserves distances, but be safe)
+        for joint in &mut template.joints { joint.x = -joint.x; }
         for push in &mut template.pushes {
             push.2 = (template.joints[push.0] - template.joints[push.1]).length();
         }
         for pull in &mut template.pulls {
             pull.2 = (template.joints[pull.0] - template.joints[pull.1]).length();
         }
-
-        // Swap spins and attach/forward roles stay the same but spins flip
         for face in &mut template.faces {
             face.spin = face.spin.opposite();
-            // Reverse winding to maintain consistent normal direction after mirror
             face.corners.swap(1, 2);
         }
-
         template
     }
 
-    /// Get the appropriate template for a given spin.
     pub fn for_spin(spin: Spin, face_radius: f32, height: f32) -> Self {
         match spin {
             Spin::Left => Self::single_twist_left(face_radius, height),
             Spin::Right => Self::single_twist_right(face_radius, height),
         }
     }
+
+    /// Find a face by name.
+    pub fn face_index_by_name(&self, name: &str) -> Option<usize> {
+        self.faces.iter().position(|f| f.name == Some(name))
+    }
+}
+
+impl BrickTemplate {
+    /// Compute the face normal for a given face index, accounting for spin.
+    pub fn face_normal(&self, face_idx: usize) -> Vec3 {
+        let face = &self.faces[face_idx];
+        let c = face.corners;
+        let v1 = self.joints[c[1]] - self.joints[c[0]];
+        let v2 = self.joints[c[2]] - self.joints[c[0]];
+        match face.spin {
+            Spin::Left => v2.cross(v1).normalize(),
+            Spin::Right => v1.cross(v2).normalize(),
+        }
+    }
+
+    /// Compute a rotation that orients the brick so the given "downward" face normal
+    /// points in the -Y direction, matching tensegrity-lab's `down_rotation`.
+    pub fn down_rotation(&self, down_face_name: &str) -> glam::Quat {
+        let face_idx = self.face_index_by_name(down_face_name)
+            .unwrap_or_else(|| panic!("No face named '{}'", down_face_name));
+        let down_normal = self.face_normal(face_idx);
+        glam::Quat::from_rotation_arc(down_normal, -Vec3::Y)
+    }
+
+    /// Apply a rotation to all joint positions.
+    pub fn apply_rotation(&mut self, rotation: glam::Quat) {
+        for joint in &mut self.joints {
+            *joint = rotation * *joint;
+        }
+        // Recompute push/pull ideal lengths from rotated positions
+        for push in &mut self.pushes {
+            push.2 = (self.joints[push.0] - self.joints[push.1]).length();
+        }
+        for pull in &mut self.pulls {
+            pull.2 = (self.joints[pull.0] - self.joints[pull.1]).length();
+        }
+    }
+}
+
+fn dist(joints: &[Vec3], a: usize, b: usize) -> f32 {
+    (joints[a] - joints[b]).length()
 }

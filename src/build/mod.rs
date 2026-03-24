@@ -1,6 +1,7 @@
 pub mod approach;
 pub mod brick;
 pub mod executor;
+pub mod fabric_library;
 pub mod face;
 pub mod placement;
 

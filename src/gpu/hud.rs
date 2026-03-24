@@ -58,12 +58,11 @@ pub const SURFACE_BUTTON_WIDTH: f32 = 108.0; // 10 chars × 10.8px (18px monospa
 pub const SURFACE_BAR_HEIGHT: f32 = 30.0;
 
 /// Build preset buttons
-pub const BUILD_CHOICES: &[(&str, usize)] = &[
-    ("Col 3", 3),
-    ("Col 6", 6),
-    ("Col 10", 10),
-    ("Col 20", 20),
-];
+use crate::build::fabric_library::{ALL_FABRICS, FabricName};
+
+pub fn build_labels() -> Vec<&'static str> {
+    ALL_FABRICS.iter().map(|f| f.label()).collect()
+}
 pub const BUILD_BUTTON_WIDTH: f32 = 75.0;
 pub const BUILD_ROW_HEIGHT: f32 = 30.0;
 pub const BUILD_BAR_TOP: f32 = 156.0; // below Surface bar
@@ -149,7 +148,7 @@ impl Hud {
         let mut surface_buffer = Buffer::new(&mut font_system, Metrics::new(18.0, SURFACE_BAR_HEIGHT));
         surface_buffer.set_size(&mut font_system, Some(surface_width), Some(SURFACE_BAR_HEIGHT + 4.0));
 
-        let build_width = BUILD_CHOICES.len() as f32 * BUILD_BUTTON_WIDTH + 20.0;
+        let build_width = ALL_FABRICS.len() as f32 * BUILD_BUTTON_WIDTH + 20.0;
         let mut build_buffer = Buffer::new(&mut font_system, Metrics::new(18.0, BUILD_ROW_HEIGHT));
         build_buffer.set_size(&mut font_system, Some(build_width), Some(BUILD_ROW_HEIGHT + 4.0));
 
@@ -389,14 +388,15 @@ impl Hud {
     }
 
     pub fn build_bar_left(&self) -> f32 {
-        self.screen_width - BUILD_CHOICES.len() as f32 * BUILD_BUTTON_WIDTH - FREQ_BAR_RIGHT_MARGIN
+        self.screen_width - ALL_FABRICS.len() as f32 * BUILD_BUTTON_WIDTH - FREQ_BAR_RIGHT_MARGIN
     }
 
-    pub fn set_build_bar(&mut self, active_count: Option<usize>, hover_index: Option<usize>) {
+    pub fn set_build_bar(&mut self, active_label: Option<&str>, hover_index: Option<usize>) {
         let mut spans: Vec<(String, Attrs)> = Vec::new();
-        for (i, &(name, count)) in BUILD_CHOICES.iter().enumerate() {
-            let label = format!(" {:^5} ", name);
-            let color = if active_count == Some(count) {
+        let labels = build_labels();
+        for (i, &name) in labels.iter().enumerate() {
+            let label = format!(" {:^6}", name);
+            let color = if active_label == Some(name) {
                 FREQ_ACTIVE
             } else if hover_index == Some(i) {
                 FREQ_HOVER
