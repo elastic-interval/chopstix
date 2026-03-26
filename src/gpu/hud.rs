@@ -58,7 +58,7 @@ pub const SURFACE_BUTTON_WIDTH: f32 = 108.0; // 10 chars × 10.8px (18px monospa
 pub const SURFACE_BAR_HEIGHT: f32 = 30.0;
 
 /// Build preset buttons
-use crate::build::fabric_library::{ALL_FABRICS, FabricName};
+use crate::build::fabric_library::ALL_FABRICS;
 
 pub fn build_labels() -> Vec<&'static str> {
     ALL_FABRICS.iter().map(|f| f.label()).collect()

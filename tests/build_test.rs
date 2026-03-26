@@ -9,7 +9,6 @@ use chopstix::build::executor::BuildExecutor;
 use chopstix::build::fabric_library::FabricName;
 use chopstix::build::face::FaceRegistry;
 use chopstix::build::placement;
-use chopstix::build::Spin;
 use chopstix::gpu::growable::GrowablePhysics;
 use chopstix::gpu::physics::PhysicsConfig;
 

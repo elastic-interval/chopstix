@@ -469,29 +469,6 @@ impl GrowablePhysics {
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
     }
 
-    /// Update params with gravity and surface for post-build phase.
-    pub fn enable_gravity(&self, queue: &wgpu::Queue, gravity: f32, ground_y: f32, surface_character: u32) {
-        let params = PhysicsParams {
-            dt: self.config.dt,
-            gravity,
-            drag: self.config.drag,
-            _reserved0: 0.0,
-            num_joints: self.active_joints,
-            num_elastic: self.active_elastic,
-            num_rigid: 0,
-            ambient_mass: self.config.ambient_mass,
-            force_scale: self.config.force_scale,
-            ground_y,
-            _reserved1: 0.0,
-            speed_limit: self.config.speed_limit,
-            num_push: self.active_push,
-            surface_character,
-            _pad2: 0,
-            _pad3: 0,
-        };
-        queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
-    }
-
     /// Write a single elastic ideal + K value at a specific index.
     pub fn write_elastic_ideal_at(&self, queue: &wgpu::Queue, index: usize, ideal: f32, k: f32) {
         let offset = (index as u64) * 4;
@@ -602,23 +579,6 @@ impl GrowablePhysics {
         value != 0
     }
 
-    /// Synchronous position readback (blocks until complete).
-    /// Used during brick placement to get current positions.
-    pub fn read_positions_sync(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-    ) -> Vec<[f32; 4]> {
-        if self.active_joints == 0 {
-            return Vec::new();
-        }
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("G Sync Readback"),
-        });
-        self.copy_positions_to_staging(&mut encoder);
-        queue.submit(std::iter::once(encoder.finish()));
-        self.read_positions(device)
-    }
 }
 
 fn create_zero_buffer(device: &wgpu::Device, label: &str, size: u64, usage: wgpu::BufferUsages) -> wgpu::Buffer {

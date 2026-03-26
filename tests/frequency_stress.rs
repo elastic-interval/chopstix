@@ -175,6 +175,7 @@ fn run_frequency(
 
 struct Scenario {
     name: String,
+    #[allow(dead_code)]
     max_frequency: usize,
     /// If true, config is scaled per-frequency via scaled_for_frequency()
     scale_with_freq: bool,

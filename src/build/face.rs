@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use glam::{Mat4, Vec3};
+use glam::Vec3;
 
 use super::approach::ApproachManager;
 use super::Spin;
@@ -161,45 +161,8 @@ impl FaceRegistry {
         self.faces.get(&id)
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.faces.is_empty()
-    }
 }
 
-/// Compute the face coordinate frame as a Mat4.
-/// Follows tensegrity-lab's vector_space convention:
-///   - Origin = centroid of 3 corners
-///   - Y axis = face normal (direction depends on spin)
-///   - X axis = direction from centroid toward midpoint of edge (c[0], c[1])
-///   - Z axis = X × Y
-///
-/// The spin parameter determines the normal direction:
-///   Left:  (c[2]-c[0]) × (c[1]-c[0])  — normal points one way
-///   Right: (c[1]-c[0]) × (c[2]-c[0])  — normal points the opposite way
-pub fn face_basis_with_spin(corners: [Vec3; 3], spin: Spin) -> Mat4 {
-    let centroid = (corners[0] + corners[1] + corners[2]) / 3.0;
-    let v1 = corners[1] - corners[0];
-    let v2 = corners[2] - corners[0];
-    let y_axis = match spin {
-        Spin::Left => v2.cross(v1).normalize(),
-        Spin::Right => v1.cross(v2).normalize(),
-    };
-    // X axis: from centroid toward midpoint of (c[0], c[1])
-    let x_axis = (corners[0] + corners[1] - centroid * 2.0).normalize();
-    let z_axis = x_axis.cross(y_axis).normalize();
-
-    Mat4::from_cols(
-        x_axis.extend(0.0),
-        y_axis.extend(0.0),
-        z_axis.extend(0.0),
-        centroid.extend(1.0),
-    )
-}
-
-/// Spin-unaware face basis (legacy, uses fixed winding).
-pub fn face_basis(corners: [Vec3; 3]) -> Mat4 {
-    face_basis_with_spin(corners, Spin::Right)
-}
 
 fn corner_pos(positions: &[[f32; 4]], joint: u32) -> Vec3 {
     let p = positions[joint as usize];

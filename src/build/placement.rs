@@ -2,7 +2,7 @@ use glam::{Mat4, Vec3};
 
 use super::approach::ApproachManager;
 use super::brick::BrickTemplate;
-use super::face::{face_basis_with_spin, FaceId, FaceRegistry};
+use super::face::{FaceId, FaceRegistry};
 use super::Spin;
 use crate::constants::PUSH_LINEAR_DENSITY;
 use crate::gpu::growable::GrowablePhysics;

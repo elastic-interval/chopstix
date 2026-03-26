@@ -53,9 +53,6 @@ pub fn prism(outer_pct: f32) -> BuildNode {
     BuildNode::Prism { outer_pct }
 }
 
-pub fn mark(name: &'static str) -> BuildNode {
-    BuildNode::Mark { name }
-}
 
 /// Fluent builder for columns, matching tensegrity-lab's FaceColumnBuilder.
 pub struct ColumnBuilder {

@@ -215,6 +215,7 @@ impl BrickTemplate {
     }
 
     /// Parametric single-twist-left (original implementation).
+    #[allow(dead_code)]
     pub fn single_twist_left(face_radius: f32, height: f32) -> Self {
         use std::f32::consts::PI;
         let twist = PI / 6.0;
@@ -260,6 +261,7 @@ impl BrickTemplate {
         Self { joints, pushes, pulls, faces }
     }
 
+    #[allow(dead_code)]
     pub fn single_twist_right(face_radius: f32, height: f32) -> Self {
         let mut template = Self::single_twist_left(face_radius, height);
         for joint in &mut template.joints { joint.x = -joint.x; }
@@ -276,6 +278,7 @@ impl BrickTemplate {
         template
     }
 
+    #[allow(dead_code)]
     pub fn for_spin(spin: Spin, face_radius: f32, height: f32) -> Self {
         match spin {
             Spin::Left => Self::single_twist_left(face_radius, height),

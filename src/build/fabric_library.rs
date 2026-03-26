@@ -11,12 +11,7 @@ pub enum FabricName {
 }
 
 pub const ALL_FABRICS: &[FabricName] = &[
-    FabricName::Column3,
-    FabricName::Column6,
-    FabricName::Flagellum,
     FabricName::OpenClaw,
-    FabricName::Triped,
-    FabricName::Mockup,
 ];
 
 impl FabricName {

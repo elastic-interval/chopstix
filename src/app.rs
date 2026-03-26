@@ -17,7 +17,7 @@ use crate::gpu::hud::{Hud, FREQ_CHOICES, FREQ_BUTTON_WIDTH, FREQ_BAR_HEIGHT, FRE
     MOBIUS_CHOICES, MOBIUS_BUTTON_WIDTH, MOBIUS_ROW_HEIGHT, MOBIUS_BAR_TOP,
     SURFACE_BUTTON_WIDTH, SURFACE_BAR_TOP, SURFACE_BAR_HEIGHT,
     BUILD_BUTTON_WIDTH, BUILD_ROW_HEIGHT, BUILD_BAR_TOP, build_labels};
-use crate::gpu::physics::{PhysicsCompute, PhysicsConfig, SURFACE_NAMES};
+use crate::gpu::physics::{PhysicsCompute, PhysicsConfig, SURFACE_ABSENT, SURFACE_BOUNCY, SURFACE_NAMES};
 use crate::gpu::renderer::Renderer;
 use crate::gpu::Gpu;
 use crate::tensegrity::{self, TensegritySphereBuffers};
@@ -128,13 +128,14 @@ impl App {
     }
 
     /// Build a PhysicsConfig appropriate for the current shape and surface.
-    fn physics_config(shape: &ShapeConfig, pull_k_at_1m: f32, frequency: usize, surface_character: u32) -> PhysicsConfig {
+    fn physics_config(pull_k_at_1m: f32, frequency: usize, surface_character: u32) -> PhysicsConfig {
         let mut config = PhysicsConfig {
             pull_k_at_1m,
             surface_character,
             ..PhysicsConfig::default()
         };
-        if matches!(shape, ShapeConfig::Klein { .. } | ShapeConfig::Mobius { .. } | ShapeConfig::Tenscript { .. }) {
+        // Gravity and surface are always coupled: no surface means no gravity
+        if surface_character == SURFACE_ABSENT {
             config.gravity = 0.0;
             config.ground_y = -1e6;
         }
@@ -188,7 +189,7 @@ impl App {
             return;
         }
 
-        let config = App::physics_config(&state.shape, state.pull_k_at_1m, state.frequency, state.surface_character);
+        let config = App::physics_config(state.pull_k_at_1m, state.frequency, state.surface_character);
         let mut buffers = App::generate_shape(&state.shape, state.pull_k_at_1m);
 
         // Settle: approach for random-start topologies, regular for spheres
@@ -225,7 +226,7 @@ impl App {
             _ => return,
         };
 
-        let config = App::physics_config(&state.shape, state.pull_k_at_1m, state.frequency, state.surface_character);
+        let config = App::physics_config(state.pull_k_at_1m, state.frequency, state.surface_character);
         state.iterations = config.iterations_per_frame;
 
         let mut growable = GrowablePhysics::new(&state.gpu.device, &config);
@@ -293,7 +294,7 @@ impl App {
         if App::is_tenscript(&state.shape) {
             return;
         }
-        let config = App::physics_config(&state.shape, state.pull_k_at_1m, state.frequency, state.surface_character);
+        let config = App::physics_config(state.pull_k_at_1m, state.frequency, state.surface_character);
 
         // Read back current positions from GPU
         let mut encoder = state.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -326,7 +327,7 @@ impl App {
         }
         state.pretension = (state.pretension * factor).clamp(0.5, 1.0);
 
-        let config = App::physics_config(&state.shape, state.pull_k_at_1m, state.frequency, state.surface_character);
+        let config = App::physics_config(state.pull_k_at_1m, state.frequency, state.surface_character);
 
         // Read back current positions
         let mut encoder = state.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -515,7 +516,7 @@ impl ApplicationHandler for App {
         } else {
             self.shape.clone()
         };
-        let config = App::physics_config(&init_shape, PULL_K_AT_1M, frequency, initial_surface);
+        let config = App::physics_config(PULL_K_AT_1M, frequency, initial_surface);
         let mut buffers = App::generate_shape(&init_shape, PULL_K_AT_1M);
 
         // Settle
@@ -637,6 +638,9 @@ impl ApplicationHandler for App {
                         if !already {
                             state.shape = ShapeConfig::Sphere { frequency: freq };
                             state.frequency = App::frequency_for_shape(&state.shape);
+                            if state.surface_character == SURFACE_ABSENT {
+                                state.surface_character = SURFACE_BOUNCY;
+                            }
                             App::schedule_rebuild(state);
                             return;
                         }
@@ -647,6 +651,7 @@ impl ApplicationHandler for App {
                         if !already {
                             state.shape = ShapeConfig::Klein { width: w, height: h, shift: 0 };
                             state.frequency = App::frequency_for_shape(&state.shape);
+                            state.surface_character = SURFACE_ABSENT;
                             App::schedule_rebuild(state);
                             return;
                         }
@@ -657,6 +662,7 @@ impl ApplicationHandler for App {
                         if !already {
                             state.shape = ShapeConfig::Mobius { segments: seg };
                             state.frequency = App::frequency_for_shape(&state.shape);
+                            state.surface_character = SURFACE_ABSENT;
                             App::schedule_rebuild(state);
                             return;
                         }
@@ -675,6 +681,7 @@ impl ApplicationHandler for App {
                         if let Some(fabric) = App::build_label_to_fabric(label) {
                             state.shape = ShapeConfig::Tenscript { fabric };
                             state.frequency = App::frequency_for_shape(&state.shape);
+                            state.surface_character = SURFACE_ABSENT;
                             App::schedule_rebuild(state);
                             return;
                         }
@@ -748,7 +755,7 @@ impl ApplicationHandler for App {
 
                 // Update HUD
                 if state.show_hud {
-                    let config = App::physics_config(&state.shape, state.pull_k_at_1m, state.frequency, state.surface_character);
+                    let config = App::physics_config(state.pull_k_at_1m, state.frequency, state.surface_character);
                     let paused_tag = if state.paused { "  PAUSED" } else { "" };
 
                     // Title

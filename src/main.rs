@@ -26,6 +26,6 @@ fn main() {
     log::info!("Starting chopstix");
 
     let event_loop = EventLoop::new().expect("Failed to create event loop");
-    let mut app = app::App::new(ShapeConfig::Tenscript { fabric: FabricName::OpenClaw });
+    let mut app = app::App::new(ShapeConfig::Sphere { frequency: 1 });
     event_loop.run_app(&mut app).expect("Event loop error");
 }
