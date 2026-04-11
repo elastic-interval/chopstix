@@ -6,6 +6,11 @@ use super::approach::ApproachManager;
 use super::Spin;
 use crate::gpu::growable::GrowablePhysics;
 
+/// Baked equilibrium strain for face radial intervals (midpoint → corner).
+/// Mirrors `tensegrity-lab/src/build/dsl/brick.rs` `BakedBrick::TARGET_FACE_STRAIN`.
+/// The ideal length is derived as `actual_distance / (1 + TARGET_FACE_STRAIN)`.
+pub const TARGET_FACE_STRAIN: f32 = 0.1;
+
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
 pub struct FaceId(pub u32);
 
@@ -60,20 +65,21 @@ impl FaceRegistry {
             &[[0.0f32; 4]],
         );
 
-        // Add 3 radial elastic intervals (centroid → each corner)
+        // Add 3 radial elastic intervals (centroid → each corner).
+        // Ideal length derived from TARGET_FACE_STRAIN so radials are born under tension,
+        // matching tensegrity-lab's `attach_brick` call to `create_strained_interval`.
         let mut radial_indices = [0usize; 3];
         for (i, &corner) in corners.iter().enumerate() {
             let actual_length = (corner_pos(positions, corner) - centroid).length();
-            let ideal = actual_length;
-            let target_ideal = actual_length;
+            let target_ideal = actual_length / (1.0 + TARGET_FACE_STRAIN);
             let k = pull_k_at_1m / target_ideal;
 
             let elastic_idx = physics.append_elastic(
                 queue,
                 &[centroid_joint],
                 &[corner],
-                &[ideal],
-                &[k],
+                &[actual_length],
+                &[k * 0.1],
             );
             radial_indices[i] = elastic_idx as usize;
 
@@ -115,35 +121,43 @@ impl FaceRegistry {
         let a_radials = face_a.radial_elastic_indices;
         let b_radials = face_b.radial_elastic_indices;
 
+        // Circumference cable target length is derived from face scale, matching
+        // tensegrity-lab's `Fabric::join_faces` which uses `(alpha.scale + omega.scale) / 2`.
+        // NOT the current geometric distance — that would tie chopstix to whatever
+        // physics deformation happened to exist at placement time.
+        let target_len = (face_a.scale + face_b.scale) / 2.0;
+
         // Create 6 circumference cables: a[i]→b[(i+1)%3] and a[i]→b[(i+2)%3]
         for i in 0..3 {
             let j1 = (i + 1) % 3;
             let j2 = (i + 2) % 3;
 
+            let k = pull_k_at_1m / target_len;
+
             let len1 = (corner_pos(positions, a_corners[i]) - corner_pos(positions, b_corners[j1])).length();
             if len1 > 1e-6 {
-                let k1 = pull_k_at_1m / len1;
+                let start1 = len1.max(0.1);
                 let idx1 = physics.append_elastic(
                     queue,
                     &[a_corners[i]],
                     &[b_corners[j1]],
-                    &[len1 * 1.5],
-                    &[k1 * 0.1],
+                    &[start1],
+                    &[k * 0.1],
                 );
-                approach.add_elastic(idx1 as usize, len1 * 1.5, len1, k1);
+                approach.add_elastic(idx1 as usize, start1, target_len, k);
             }
 
             let len2 = (corner_pos(positions, a_corners[i]) - corner_pos(positions, b_corners[j2])).length();
             if len2 > 1e-6 {
-                let k2 = pull_k_at_1m / len2;
+                let start2 = len2.max(0.1);
                 let idx2 = physics.append_elastic(
                     queue,
                     &[a_corners[i]],
                     &[b_corners[j2]],
-                    &[len2 * 1.5],
-                    &[k2 * 0.1],
+                    &[start2],
+                    &[k * 0.1],
                 );
-                approach.add_elastic(idx2 as usize, len2 * 1.5, len2, k2);
+                approach.add_elastic(idx2 as usize, start2, target_len, k);
             }
         }
 

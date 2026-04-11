@@ -115,42 +115,44 @@ fn has_nan(positions: &[[f32; 4]]) -> bool {
 
 #[test]
 fn brick_template_geometry() {
-    let template = BrickTemplate::single_twist_left(2.0, 7.0);
+    // Use the baked template — this is the one the build system actually uses.
+    let template = BrickTemplate::single_twist_left_baked();
 
     assert_eq!(template.joints.len(), 6, "Should have 6 joints");
     assert_eq!(template.pushes.len(), 3, "Should have 3 push struts");
     assert_eq!(template.pulls.len(), 3, "Should have 3 pull cables");
     assert_eq!(template.faces.len(), 2, "Should have 2 faces");
 
-    // Check that push lengths are reasonable
-    for &(a, o, ideal) in &template.pushes {
+    // Baked strain values must match tensegrity-lab/src/build/dsl/brick_library/baked_bricks.rs
+    // (single_twist_left_baked).
+    let expected_push_strain = -0.01509_f32;
+    let expected_pull_strain = 0.10576_f32;
+
+    for &(a, o, strain) in &template.pushes {
         let actual = (template.joints[a] - template.joints[o]).length();
-        println!("Push {}->{}: ideal={:.3}, actual={:.3}, diff={:.6}",
-            a, o, ideal, actual, (ideal - actual).abs());
-        assert!((ideal - actual).abs() < 1e-5,
-            "Push ideal should match computed distance");
-        assert!(ideal > 5.0 && ideal < 10.0,
-            "Push length {:.2} should be reasonable", ideal);
+        let ideal = actual / (1.0 + strain);
+        println!("Push {}->{}: strain={:.5}, actual={:.5}, ideal={:.5}",
+            a, o, strain, actual, ideal);
+        assert!((strain - expected_push_strain).abs() < 1e-6,
+            "push strain {:.6} != expected {:.6}", strain, expected_push_strain);
     }
 
-    // Check that pull lengths are reasonable
-    for &(a, o, ideal) in &template.pulls {
+    for &(a, o, strain) in &template.pulls {
         let actual = (template.joints[a] - template.joints[o]).length();
-        println!("Pull {}->{}: ideal={:.3}, actual={:.3}, diff={:.6}",
-            a, o, ideal, actual, (ideal - actual).abs());
-        assert!((ideal - actual).abs() < 1e-5,
-            "Pull ideal should match computed distance");
-        assert!(ideal > 5.0 && ideal < 10.0,
-            "Pull length {:.2} should be reasonable", ideal);
+        let ideal = actual / (1.0 + strain);
+        println!("Pull {}->{}: strain={:.5}, actual={:.5}, ideal={:.5}",
+            a, o, strain, actual, ideal);
+        assert!((strain - expected_pull_strain).abs() < 1e-6,
+            "pull strain {:.6} != expected {:.6}", strain, expected_pull_strain);
     }
 
-    // Check face definitions
+    // Check face definitions match the baked convention.
     let attach = template.faces.iter().find(|f| f.is_attach).unwrap();
-    assert_eq!(attach.corners, [0, 1, 2], "Attach face should use bottom joints");
+    assert_eq!(attach.corners, [0, 2, 4], "Baked attach face: AlphaX/Y/Z");
     let forward = template.faces.iter().find(|f| f.is_forward).unwrap();
-    assert_eq!(forward.corners, [3, 4, 5], "Forward face should use top joints");
+    assert_eq!(forward.corners, [5, 3, 1], "Baked forward face: OmegaZ/Y/X");
 
-    println!("SingleTwistLeft template geometry OK");
+    println!("SingleTwistLeft baked template geometry OK");
 }
 
 #[test]
@@ -269,14 +271,16 @@ fn omni_brick_geometry() {
     assert_eq!(template.pulls.len(), 0, "Omni should have 0 pulls");
     assert_eq!(template.faces.len(), 8, "Omni should have 8 faces");
 
-    // Verify push lengths are consistent (all should be equal for symmetrical)
-    let push_len = template.pushes[0].2;
+    // All 6 pushes share the baked equilibrium strain from tensegrity-lab.
+    let expected_strain = -0.01428_f32;
     for (i, push) in template.pushes.iter().enumerate() {
-        println!("Push {}: {} → {}, len={:.4}", i, push.0, push.1, push.2);
-        assert!((push.2 - push_len).abs() < 0.01,
-            "Push {} length {:.4} != {:.4}", i, push.2, push_len);
+        let actual = (template.joints[push.0] - template.joints[push.1]).length();
+        let ideal = actual / (1.0 + push.2);
+        println!("Push {}: {} → {}, strain={:.5}, actual={:.5}, ideal={:.5}",
+            i, push.0, push.1, push.2, actual, ideal);
+        assert!((push.2 - expected_strain).abs() < 1e-6,
+            "Push {} strain {:.6} != expected {:.6}", i, push.2, expected_strain);
     }
-    println!("Push length: {:.4}", push_len);
 
     // Verify named faces exist
     for name in &["OmniTop", "OmniBot", "OmniBotX", "OmniBotY", "OmniBotZ"] {

@@ -76,11 +76,14 @@ pub fn place_brick(
         positions.extend_from_slice(&new_positions);
     }
 
-    // Create push intervals with approaching ideals
-    for &(a, o, target_ideal) in &template.pushes {
+    // Create push intervals with approaching ideals.
+    // Ideal length derived from the baked strain: ideal = actual / (1 + strain).
+    // (tensegrity-lab's create_strained_interval formula.)
+    for &(a, o, strain) in &template.pushes {
         let alpha = joint_map[a];
         let omega = joint_map[o];
         let actual = (pos_vec3(positions, alpha) - pos_vec3(positions, omega)).length();
+        let target_ideal = actual / (1.0 + strain);
         let start_ideal = actual.max(0.1);
         let k = pull_k_at_1m / target_ideal;
         let half_mass = PUSH_LINEAR_DENSITY * target_ideal / 2.0;
@@ -96,11 +99,12 @@ pub fn place_brick(
         approach.add_push(idx as usize, start_ideal, target_ideal, k);
     }
 
-    // Create pull intervals with approaching ideals
-    for &(a, o, target_ideal) in &template.pulls {
+    // Create pull intervals with approaching ideals.
+    for &(a, o, strain) in &template.pulls {
         let alpha = joint_map[a];
         let omega = joint_map[o];
         let actual = (pos_vec3(positions, alpha) - pos_vec3(positions, omega)).length();
+        let target_ideal = actual / (1.0 + strain);
         let start_ideal = actual.max(0.1);
         let k = pull_k_at_1m / target_ideal;
 
@@ -217,10 +221,13 @@ pub fn place_seed_brick(
 
     let start_joint = physics.append_joints(queue, &positions, &velocities);
 
-    // Create push intervals at target (no approach for seed)
-    for &(a, o, target_ideal) in &template.pushes {
+    // Create push intervals at target (no approach for seed).
+    // ideal = actual / (1 + strain) — same strain semantics as tensegrity-lab.
+    for &(a, o, strain) in &template.pushes {
         let alpha = start_joint + a as u32;
         let omega = start_joint + o as u32;
+        let actual = (template.joints[a] - template.joints[o]).length();
+        let target_ideal = actual / (1.0 + strain);
         let k = pull_k_at_1m / target_ideal;
         let half_mass = PUSH_LINEAR_DENSITY * target_ideal / 2.0;
 
@@ -235,9 +242,11 @@ pub fn place_seed_brick(
     }
 
     // Create pull intervals at target
-    for &(a, o, target_ideal) in &template.pulls {
+    for &(a, o, strain) in &template.pulls {
         let alpha = start_joint + a as u32;
         let omega = start_joint + o as u32;
+        let actual = (template.joints[a] - template.joints[o]).length();
+        let target_ideal = actual / (1.0 + strain);
         let k = pull_k_at_1m / target_ideal;
 
         physics.append_elastic(

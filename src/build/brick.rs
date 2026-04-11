@@ -13,9 +13,12 @@ pub struct BrickFace {
 
 pub struct BrickTemplate {
     pub joints: Vec<Vec3>,
-    /// (alpha_idx, omega_idx, ideal_length) in template-local joint indices
+    /// (alpha_idx, omega_idx, strain) in template-local joint indices.
+    /// `strain` is the baked equilibrium strain from tensegrity-lab:
+    /// `strain = (actual - ideal) / ideal`, so `ideal = actual / (1 + strain)`.
+    /// Push struts have negative strain (compressed), pulls positive (stretched).
     pub pushes: Vec<(usize, usize, f32)>,
-    /// (alpha_idx, omega_idx, ideal_length) in template-local joint indices
+    /// (alpha_idx, omega_idx, strain) — see `pushes` for semantics.
     pub pulls: Vec<(usize, usize, f32)>,
     pub faces: Vec<BrickFace>,
 }
@@ -39,16 +42,21 @@ impl BrickTemplate {
             Vec3::new(-0.00001, 0.96246, 1.10020),    // 5: OmegaZ
         ];
 
+        // Baked equilibrium strain from tensegrity-lab/src/build/dsl/brick_library/baked_bricks.rs
+        // (single_twist_left_baked). Push = compression, pull = tension.
+        let push_strain = -0.01509_f32;
+        let pull_strain = 0.10576_f32;
+
         let pushes = vec![
-            (0, 1, dist(&joints, 0, 1)), // AlphaX → OmegaX
-            (2, 3, dist(&joints, 2, 3)), // AlphaY → OmegaY
-            (4, 5, dist(&joints, 4, 5)), // AlphaZ → OmegaZ
+            (0, 1, push_strain), // AlphaX → OmegaX
+            (2, 3, push_strain), // AlphaY → OmegaY
+            (4, 5, push_strain), // AlphaZ → OmegaZ
         ];
 
         let pulls = vec![
-            (0, 3, dist(&joints, 0, 3)), // AlphaX → OmegaY
-            (2, 5, dist(&joints, 2, 5)), // AlphaY → OmegaZ
-            (4, 1, dist(&joints, 4, 1)), // AlphaZ → OmegaX
+            (0, 3, pull_strain), // AlphaX → OmegaY
+            (2, 5, pull_strain), // AlphaY → OmegaZ
+            (4, 1, pull_strain), // AlphaZ → OmegaX
         ];
 
         let faces = vec![
@@ -71,21 +79,13 @@ impl BrickTemplate {
         Self { joints, pushes, pulls, faces }
     }
 
-    /// SingleTwistRight: mirror of left.
+    /// SingleTwistRight: mirror of left. Strain is invariant under mirroring.
     pub fn single_twist_right_baked() -> Self {
         let mut template = Self::single_twist_left_baked();
 
         // Mirror X coordinates
         for joint in &mut template.joints {
             joint.x = -joint.x;
-        }
-
-        // Recompute lengths
-        for push in &mut template.pushes {
-            push.2 = (template.joints[push.0] - template.joints[push.1]).length();
-        }
-        for pull in &mut template.pulls {
-            pull.2 = (template.joints[pull.0] - template.joints[pull.1]).length();
         }
 
         // Flip spins and reverse winding
@@ -131,13 +131,15 @@ impl BrickTemplate {
             Vec3::new( 0.00000,  0.77839,  1.55675), // 11: TopOmegaZ
         ];
 
+        // Baked strain from tensegrity-lab omni_symmetrical_baked.
+        let push_strain = -0.01428_f32;
         let pushes = vec![
-            (0, 1, dist(&joints, 0, 1)),   // BotAlphaX → BotOmegaX
-            (2, 3, dist(&joints, 2, 3)),   // TopAlphaX → TopOmegaX
-            (4, 5, dist(&joints, 4, 5)),   // BotAlphaY → BotOmegaY
-            (6, 7, dist(&joints, 6, 7)),   // TopAlphaY → TopOmegaY
-            (8, 9, dist(&joints, 8, 9)),   // BotAlphaZ → BotOmegaZ
-            (10, 11, dist(&joints, 10, 11)), // TopAlphaZ → TopOmegaZ
+            (0, 1, push_strain),   // BotAlphaX → BotOmegaX
+            (2, 3, push_strain),   // TopAlphaX → TopOmegaX
+            (4, 5, push_strain),   // BotAlphaY → BotOmegaY
+            (6, 7, push_strain),   // TopAlphaY → TopOmegaY
+            (8, 9, push_strain),   // BotAlphaZ → BotOmegaZ
+            (10, 11, push_strain), // TopAlphaZ → TopOmegaZ
         ];
 
         // Omni brick has no pull cables — all connectivity comes from face joins
@@ -244,15 +246,16 @@ impl BrickTemplate {
         );
 
         let joints = vec![j0, j1, j2, j3, j4, j5];
+        // Parametric fallback: no equilibrium strain (structure is defined purely by geometry).
         let pushes = vec![
-            (0, 5, (j0 - j5).length()),
-            (1, 3, (j1 - j3).length()),
-            (2, 4, (j2 - j4).length()),
+            (0, 5, 0.0),
+            (1, 3, 0.0),
+            (2, 4, 0.0),
         ];
         let pulls = vec![
-            (0, 3, (j0 - j3).length()),
-            (1, 4, (j1 - j4).length()),
-            (2, 5, (j2 - j5).length()),
+            (0, 3, 0.0),
+            (1, 4, 0.0),
+            (2, 5, 0.0),
         ];
         let faces = vec![
             BrickFace { corners: [0, 1, 2], spin: Spin::Left, is_attach: true, is_forward: false, name: None },
@@ -265,12 +268,6 @@ impl BrickTemplate {
     pub fn single_twist_right(face_radius: f32, height: f32) -> Self {
         let mut template = Self::single_twist_left(face_radius, height);
         for joint in &mut template.joints { joint.x = -joint.x; }
-        for push in &mut template.pushes {
-            push.2 = (template.joints[push.0] - template.joints[push.1]).length();
-        }
-        for pull in &mut template.pulls {
-            pull.2 = (template.joints[pull.0] - template.joints[pull.1]).length();
-        }
         for face in &mut template.faces {
             face.spin = face.spin.opposite();
             face.corners.swap(1, 2);
@@ -314,21 +311,10 @@ impl BrickTemplate {
         glam::Quat::from_rotation_arc(down_normal, -Vec3::Y)
     }
 
-    /// Apply a rotation to all joint positions.
+    /// Apply a rotation to all joint positions. Strain is invariant under rigid rotation.
     pub fn apply_rotation(&mut self, rotation: glam::Quat) {
         for joint in &mut self.joints {
             *joint = rotation * *joint;
         }
-        // Recompute push/pull ideal lengths from rotated positions
-        for push in &mut self.pushes {
-            push.2 = (self.joints[push.0] - self.joints[push.1]).length();
-        }
-        for pull in &mut self.pulls {
-            pull.2 = (self.joints[pull.0] - self.joints[pull.1]).length();
-        }
     }
-}
-
-fn dist(joints: &[Vec3], a: usize, b: usize) -> f32 {
-    (joints[a] - joints[b]).length()
 }
